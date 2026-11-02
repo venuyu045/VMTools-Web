@@ -408,34 +408,35 @@ class TestWaitForPings(unittest.TestCase):
         self.assertTrue(still_waiting)
         self.assertEqual([ping.dimension for ping in batch.pings], [NETHER])
 
-    def test_waiter_cap_returns_room_full(self):
+    def test_room_waiter_cap_returns_empty_batch_immediately(self):
+        """协议 v1.1 §6：每房间等待者超限 → **立即返回空数组**（不是 429）。"""
         fixture = RelayFixture(max_waiters_per_room=1)
 
         async def scenario():
             first = asyncio.create_task(fixture.relay.wait_for_pings(ROOM_A, 0, 5.0))
             await asyncio.sleep(0.02)
+            started = time.monotonic()
             try:
-                with self.assertRaises(relay.PingRelayError) as ctx:
-                    await fixture.relay.wait_for_pings(ROOM_A, 0, 5.0)
-                return ctx.exception
+                batch = await fixture.relay.wait_for_pings(ROOM_A, 0, 5.0)
             finally:
                 first.cancel()
                 await asyncio.gather(first, return_exceptions=True)
+            return batch, time.monotonic() - started
 
-        error = asyncio.run(scenario())
-        self.assertEqual(error.code, "room_full")
-        self.assertEqual(error.status_code, 429)
+        batch, elapsed = asyncio.run(scenario())
+        self.assertEqual((batch.seq, batch.pings), (0, []))
+        self.assertLess(elapsed, 0.5, "超出等待者上限必须立刻返回，不能真等 5s")
 
     def test_publish_between_snapshot_and_registration_is_not_lost(self):
         """竞态回归：注册等待者之前到达的标点不能被「丢唤醒」拖到超时。"""
         fixture = RelayFixture()
-        original_add = fixture.relay._add_waiter
+        original_add = fixture.relay._try_add_waiter
 
         def racy_add_waiter(room_key, loop):
             fixture.publish()  # 模拟「snapshot 之后、注册之前」有发送方写入
             return original_add(room_key, loop)
 
-        fixture.relay._add_waiter = racy_add_waiter
+        fixture.relay._try_add_waiter = racy_add_waiter
         started = time.monotonic()
         batch = asyncio.run(fixture.relay.wait_for_pings(ROOM_A, 0, 1.0))
         elapsed = time.monotonic() - started

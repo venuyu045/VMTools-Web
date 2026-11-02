@@ -29,7 +29,7 @@
 标点 TTL                   20s        惰性清理（房间被访问时才扫一遍）
 房间空闲回收               60s        无活动且无等待者即回收（``seq`` 随之归零）
 全局房间数                 1000       超限先回收空闲房间，仍超限 ``room_full``
-每房间等待者               64         超出 ``room_full``（429）
+每房间等待者               64         超出**立即返回 200 空数组**（协议 v1.1 §6）
 全局长轮询并发             5000       超出 ``server_busy``（503 + Retry-After）
 每玩家发送                 5 条 / 3s  滑动窗口，超出 ``rate_limited``（429 + Retry-After）
 =========================  =========  ==============================================
@@ -590,11 +590,13 @@ class PingRelay:
 
         - ``timeout`` 缺省取配置（20s），上限 25s，负数按 0 处理（= 立即返回）
         - 期间被发送方唤醒但只有**别的维度**的标点 → 继续等剩余时间
-        - 房间等待者上限 64 → ``room_full``（429）；全局长轮询上限 5000 →
-          ``server_busy``（503，带 ``Retry-After``）
+        - 房间等待者上限 64 → **立即返回空数组**（200，协议 v1.1 §6；客户端按正常
+          超时处理并立刻重试）
+        - 全局长轮询上限 5000 → ``server_busy``（503，带 ``Retry-After``）
 
         Raises:
-            PingRelayError: ``bad_request`` / ``room_full`` / ``server_busy``
+            PingRelayError: ``bad_request`` / ``room_full``（全局房间数满）/
+                ``server_busy``
         """
         room_key = normalize_room_id(room_id)
         since_value = max(0, int(since or 0))
@@ -609,7 +611,11 @@ class PingRelay:
             remaining = deadline - loop.time()
             if remaining <= 0:
                 return batch
-            waiter = self._add_waiter(room_key, loop)
+            waiter = self._try_add_waiter(room_key, loop)
+            if waiter is None:
+                # 协议 v1.1 §6：每房间等待者超限 → **立即返回空数组**（不是错误，
+                # 客户端按「正常超时」处理并立刻重试；只有全局并发打满才 503）
+                return self.snapshot(room_key, since_value, dim, create=False)
             try:
                 # 注册后再查一次：覆盖「上面 snapshot 之后、注册之前」有人 publish 的
                 # 竞态（同步路由在线程池里发送时真会发生）。注册之后到达的 publish
@@ -699,16 +705,17 @@ class PingRelay:
             pings.popleft()
 
     # ── 内部：等待者 ────────────────────────────────────────────────────
-    def _add_waiter(self, room_key: str, loop: asyncio.AbstractEventLoop) -> _Waiter:
+    def _try_add_waiter(
+        self, room_key: str, loop: asyncio.AbstractEventLoop
+    ) -> Optional[_Waiter]:
+        """注册等待者；本房间订阅者已满时返回 ``None``（调用方按协议返回空数组）。"""
         now = self._now()
         with self._lock:
             room = self._rooms.get(room_key)
             if room is None:
                 room = self._create_room_locked(room_key, now)
             if len(room.waiters) >= self.config.max_waiters_per_room:
-                raise PingRelayError(
-                    "room_full", "该房间订阅者过多，请稍后再试", 429, retry_after=1
-                )
+                return None
             if len(self._waiters) >= self.config.max_waiters_total:
                 # 全局长轮询打满：503（客户端按 server_error 退避重试，别当成房间问题）
                 raise PingRelayError(
