@@ -2,7 +2,7 @@
 
 ## 概述
 
-MCC（Minecraft Console Client）远程管理是 vmtools-next 的一站式 Web 管理平台。用户无需 SSH 登录服务器，即可在浏览器中完成 MCC 多实例创建、账号配置、启动/停止、实时终端、文件编辑等全部操作。
+MCC（Minecraft Console Client）远程管理是 VMTools-Web（历史名 vmtools-next）的一站式 Web 管理平台。用户无需 SSH 登录服务器，即可在浏览器中完成 MCC 多实例创建、账号配置、启动/停止、实时终端、文件编辑等全部操作。
 
 ## ⚠️ Minecraft 26.3 必读（2026-10-25）
 

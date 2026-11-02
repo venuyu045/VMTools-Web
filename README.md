@@ -1,8 +1,11 @@
-# VMTools-Web（vmtools-next）
+# VMTools-Web
 
 基于无头 **Minecraft Console Client (MCC)** 与 **Mineflayer** 双引擎的 Minecraft Bot 一站式远程管理平台。无需 SSH 登录服务器，在浏览器中即可完成多实例管理、Web 终端、自动化物流、多机器人协作建造等全部操作。
 
 > 本平台是 VMTools v3 项目的服务端部分，运行在 Linux 服务器上（Ubuntu 20.04+ / Debian 11+）。
+>
+> 仓库：[GitHub `venuyu045/VMTools-Web`](https://github.com/venuyu045/VMTools-Web) ｜ 镜像：[Gitee `de-spider/vmtools-next`](https://gitee.com/de-spider/vmtools-next)
+> （历史名称 `vmtools-next` 保留在服务名、部署目录与 Gitee 镜像上，不影响使用。）
 
 ## 主要特性
 
@@ -34,9 +37,10 @@
 ## 快速开始（Docker，推荐）
 
 ```bash
-# 1. 克隆项目
-git clone https://gitee.com/de-spider/vmtools-next.git
-cd vmtools-next
+# 1. 克隆项目（GitHub 主仓库；国内可用 Gitee 镜像）
+git clone https://github.com/venuyu045/VMTools-Web.git
+# 或：git clone https://gitee.com/de-spider/vmtools-next.git
+cd VMTools-Web
 
 # 2. 准备环境变量（VMT_SECRET_KEY 可留占位值，start.sh 会自动生成）
 cp .env.example .env
@@ -203,7 +207,7 @@ curl -s -X DELETE $BASE/admin/packs/wings/1.2.0 -H "Authorization: Bearer $TOKEN
 ## 项目结构
 
 ```
-vmtools-next/
+VMTools-Web/
 ├── backend/                      # Python FastAPI 后端
 │   ├── src/vmtools_next/
 │   │   ├── api/routers/          # REST API 路由（auth/mcc_instances/logistics/build_map_art/lixiangxiang/fashion…）
