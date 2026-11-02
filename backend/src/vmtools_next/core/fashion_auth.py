@@ -22,6 +22,9 @@
 - 皮肤站地址只允许使用配置白名单内的 base；客户端上报的 ``authServer`` 仅当
   落在白名单内才采用，否则忽略 —— 防 SSRF / 防把 token 送给攻击者域名
 - 所有对外 HTTP 调用 5s 超时；调用失败返回结构化错误，不抛 500
+- 挑战与 token 都带**用途**（``audience``）：``fashion`` / ``ping`` 共用同一套挑战表
+  与 hasJoined 校验，但 ``serverId`` 与 token 都不能跨用途使用（见
+  ``AUDIENCE_FASHION`` / ``AUDIENCE_PING``）。
 
 模块不 import ``jwt`` / ``httpx`` 于顶层：两者在离线测试环境没有 stub，且延迟
 导入可以让 import 冒烟在无依赖机器上通过（与 ``api/deps.py`` 的写法一致）。
@@ -44,6 +47,11 @@ from loguru import logger
 
 AUTH_TYPE_MOJANG = "mojang"
 AUTH_TYPE_YGGDRASIL = "yggdrasil"
+
+# token 受众（JWT ``aud``）。同一套挑战表 / hasJoined 校验被多个 mod 复用，
+# 靠 aud 区分用途：fashion token 不能调 ping 接口，ping token 也不能调时装接口。
+AUDIENCE_FASHION = "fashion"
+AUDIENCE_PING = "ping"
 
 # MC 用户名：3-16 位字母/数字/下划线（正版与主流皮肤站一致）
 _MC_NAME_RE = re.compile(r"^[A-Za-z0-9_]{3,16}$")
@@ -293,6 +301,9 @@ class Challenge:
     source_ip: str
     created_at: float
     expires_at: float
+    #: 该挑战签发时声明的用途（token 受众）。挑战表是 fashion / ping 共用的，
+    #: 记下用途后「ping 的 serverId」就不能拿去换 fashion token（反之亦然）。
+    audience: str = AUDIENCE_FASHION
 
     @property
     def ttl_remaining(self) -> int:
@@ -316,8 +327,13 @@ def create_challenge(
     *,
     source_ip: str = "",
     settings: Any = None,
+    audience: str = AUDIENCE_FASHION,
 ) -> Challenge:
-    """生成一次性 serverId 并缓存（TTL 见配置，默认 120s）。"""
+    """生成一次性 serverId 并缓存（TTL 见配置，默认 120s）。
+
+    ``audience`` 只记录用途（默认 ``fashion``）；VMPing 传 ``ping``，
+    消费时必须带同一个值，防止跨用途重放。
+    """
     cfg = _settings(settings)
     uuid_norm = normalize_uuid(mc_uuid)
     name_norm = normalize_mc_name(mc_name)
@@ -334,6 +350,7 @@ def create_challenge(
         source_ip=(source_ip or "").strip(),
         created_at=now,
         expires_at=now + ttl,
+        audience=str(audience or AUDIENCE_FASHION),
     )
     with _CHALLENGE_LOCK:
         _prune_challenges(now)
@@ -343,8 +360,8 @@ def create_challenge(
                 _CHALLENGES.pop(key, None)
         _CHALLENGES[challenge.server_id] = challenge
     logger.info(
-        "fashion challenge issued uuid={} name={} type={} ttl={}s",
-        uuid_norm, name_norm, auth_type, ttl,
+        "{} challenge issued uuid={} name={} type={} ttl={}s",
+        challenge.audience, uuid_norm, name_norm, auth_type, ttl,
     )
     return challenge
 
@@ -356,10 +373,11 @@ def consume_challenge(
     *,
     source_ip: str = "",
     settings: Any = None,
+    audience: str = AUDIENCE_FASHION,
 ) -> Challenge:
     """校验并**消费** challenge（一次性）。
 
-    依次校验：存在 → 未过期 → 未被使用 → UUID/用户名一致 → 来源 IP 一致。
+    依次校验：存在 → 未过期 → 未被使用 → 用途一致 → UUID/用户名一致 → 来源 IP 一致。
     任一失败都会抛 :class:`FashionAuthError`（消费失败时保留记录，除过期/已用）。
     """
     sid = str(server_id or "").strip()
@@ -379,6 +397,11 @@ def consume_challenge(
         if uuid_norm != challenge.mc_uuid or name_norm.lower() != challenge.mc_name.lower():
             raise FashionAuthError(
                 "challenge_mismatch", "serverId 与本次认证的账号不匹配", status_code=403
+            )
+        # 用途隔离：ping 的 serverId 不能拿去换 fashion token（反之亦然）
+        if challenge.audience != str(audience or AUDIENCE_FASHION):
+            raise FashionAuthError(
+                "challenge_mismatch", "serverId 与本次认证的用途不匹配", status_code=403
             )
         if challenge.source_ip and source_ip and challenge.source_ip != source_ip:
             raise FashionAuthError(
@@ -517,18 +540,29 @@ def issue_token(
     mc_name: str = "",
     settings: Any = None,
     secret: Optional[str] = None,
+    audience: str = AUDIENCE_FASHION,
+    ttl_seconds: Optional[int] = None,
 ) -> tuple[str, int]:
-    """签发 mod 专用 JWT（``aud="fashion"``），返回 ``(token, ttl_seconds)``。"""
+    """签发 mod 专用 JWT，返回 ``(token, ttl_seconds)``。
+
+    ``audience`` 默认 ``fashion``（VMFashion 的 token）；VMPing 传 ``ping``，
+    两套 token 靠 ``aud`` 隔离，签名密钥相同也不会被另一套接口接受。
+    ``ttl_seconds`` 缺省取配置 ``token_ttl_seconds``（默认 24h）。
+    """
     import jwt
 
     cfg = _settings(settings)
-    ttl = int(getattr(cfg, "token_ttl_seconds", 86400) or 86400)
+    if ttl_seconds is None:
+        ttl = int(getattr(cfg, "token_ttl_seconds", 86400) or 86400)
+    else:
+        ttl = int(ttl_seconds)
+    aud = str(audience or AUDIENCE_FASHION)
     key, alg = _jwt_params(secret)
     now = int(time.time())
     payload = {
         "sub": identity_id,
-        "aud": "fashion",
-        "typ": "fashion",
+        "aud": aud,
+        "typ": aud,
         "iat": now,
         "exp": now + ttl,
         "mcUuid": mc_uuid,
@@ -538,18 +572,23 @@ def issue_token(
 
 
 def decode_token(
-    token: str, *, settings: Any = None, secret: Optional[str] = None
+    token: str,
+    *,
+    settings: Any = None,
+    secret: Optional[str] = None,
+    audience: str = AUDIENCE_FASHION,
 ) -> dict:
-    """校验 fashion token 并返回 claims。
+    """校验 mod token 并返回 claims（默认 ``aud="fashion"``）。
 
     Raises:
-        FashionAuthError: ``invalid_token``（签名错 / 过期 / 不是 fashion token）
+        FashionAuthError: ``invalid_token``（签名错 / 过期 / 受众不符）
     """
     import jwt
 
+    aud = str(audience or AUDIENCE_FASHION)
     key, alg = _jwt_params(secret)
     try:
-        claims = jwt.decode(token, key, algorithms=[alg], audience="fashion")
+        claims = jwt.decode(token, key, algorithms=[alg], audience=aud)
     except Exception as exc:
         raise FashionAuthError("invalid_token", "token 无效或已过期", status_code=401) from exc
     if not isinstance(claims, dict) or not claims.get("sub"):

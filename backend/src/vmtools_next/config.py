@@ -395,6 +395,48 @@ class FashionSettings(BaseModel):
         return value
 
 
+class PingSettings(BaseModel):
+    """标点中继（VMPing Fabric 客户端 mod）配置。
+
+    环境变量：``VMT_PING__MAX_PINGS_PER_ROOM=200``、``VMT_PING__ENABLED=false`` ……
+
+    默认值对齐 ``docs/协议-v1.md`` §6。**纯内存**服务：改配置需要重启进程，
+    且多 worker 部署会各进程独立（必须单 worker，见 ``docs/后端实现.md``）。
+    """
+
+    enabled: bool = True
+
+    # ── 房间 / 容量 ──
+    # 每房间存活标点上限（满了返回 429 room_full）
+    max_pings_per_room: int = 200
+    # 标点 TTL（秒，惰性清理）
+    ping_ttl_seconds: float = 20.0
+    # 房间空闲回收（秒）：无活动且无等待者即回收（房间重建后 seq 从 0/1 重新开始）
+    room_idle_seconds: float = 60.0
+    # 全局房间数上限（超限先回收空闲房间，仍超限返回 429 room_full）
+    max_rooms: int = 1000
+    # 每房间长轮询等待者上限（超出 429 room_full）
+    max_waiters_per_room: int = 64
+    # 全局长轮询并发上限（跨房间；超出 503 server_busy + Retry-After）。
+    # 一个等待者 = 一个挂起中的 HTTP 连接，单进程部署必须给个硬上限。
+    max_waiters_total: int = 5000
+
+    # ── 限流 ──
+    # 每玩家（mcUuid）发送限流：N 条 / 窗口秒（滑动窗口）
+    rate_limit: int = 5
+    rate_window_seconds: float = 3.0
+    # 认证 challenge 限流（每来源 IP）：防刷爆与 fashion 共用的挑战表
+    challenge_rate_limit: int = 20
+    challenge_rate_window_seconds: float = 60.0
+
+    # ── 长轮询 / token ──
+    # 长轮询默认等待与上限（秒）；协议 §5 规定默认 20、上限 25
+    wait_timeout_seconds: float = 20.0
+    max_wait_timeout_seconds: float = 25.0
+    # 签发给 mod 的 ping token 有效期（默认 24h，协议 §2.3）
+    token_ttl_seconds: int = 86400
+
+
 class AppConfig(BaseSettings):
     """Top-level application configuration."""
 
@@ -420,6 +462,7 @@ class AppConfig(BaseSettings):
     bluemap: BlueMapConfig = Field(default_factory=BlueMapConfig)
     access_control: AccessControlConfig = Field(default_factory=AccessControlConfig)
     fashion: FashionSettings = Field(default_factory=FashionSettings)
+    ping: PingSettings = Field(default_factory=PingSettings)
 
 
 # ── Loader ──────────────────────────────────────────────────────────────

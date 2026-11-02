@@ -37,6 +37,7 @@ from vmtools_next.api.routers.lixiangxiang import router as lixiangxiang_router
 from vmtools_next.api.routers.tasks import router as tasks_router
 from vmtools_next.api.routers.access import router as access_router
 from vmtools_next.api.routers.fashion import router as fashion_router
+from vmtools_next.api.routers.ping import router as ping_router
 from vmtools_next.adapters.mcc.mcc_session_pool import MccSessionPool
 from vmtools_next.adapters.mineflayer.mineflayer_session_pool import MineflayerSessionPool
 from vmtools_next.core.task_engine import TaskEngine
@@ -546,6 +547,10 @@ def create_app() -> FastAPI:
     # VMT_FASHION__ENABLED（docs/fashion-api.md §11）：默认开启；关闭后不挂载时装路由
     if config.fashion.enabled:
         app.include_router(fashion_router)
+    # VMT_PING__ENABLED（docs/后端实现.md）：默认开启；关闭后不挂载标点中继路由。
+    # 用 getattr 兜底：老配置对象 / 离线 stub 环境下 config.ping 可能是 None。
+    if getattr(getattr(config, "ping", None), "enabled", True):
+        app.include_router(ping_router)
 
     # Static files (Web UI — will be populated in phase 6)
     static_dir = BASE_DIR.parent.parent / "static"
