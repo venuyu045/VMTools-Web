@@ -447,6 +447,34 @@ class TestSendPing(ApiBase):
         self.send(version="1.0.0")
         self.assertEqual(self.relay.stats()["pings"], 1)
 
+    def test_send_ping_logs_with_matching_placeholders(self):
+        """回归（生产事故）：loguru 是 str.format 风格，占位符数量必须和实参一致。
+
+        2026-11-02 线上实测 ``POST /api/ping/rooms/{id}/pings`` 返回 500：
+        ``logger.debug("... version={} clientTime={} room={} seq={} player={}", ...)``
+        少传了 ``room``，loguru 在 ``message.format(*args)`` 抛 ``IndexError``。
+        本机 loguru 是 stub（吞参数）所以原有用例没抓到，这里用一个**严格 logger**
+        模拟真实行为（格式化失败就抛），把这类问题挡在提交前。
+        """
+
+        class _StrictLogger:
+            def _log(self, message, *args, **kwargs):
+                message.format(*args)
+
+            debug = _log
+            info = _log
+            warning = _log
+            error = _log
+
+        original = api.logger
+        api.logger = _StrictLogger()
+        try:
+            response = self.send(version="0.1.0", body=make_body(client_time=123))
+        finally:
+            api.logger = original
+        self.assertEqual(_attr(response, "seq"), 1)
+        self.assertEqual(self.relay.stats()["pings"], 1)
+
     def test_send_ping_bad_room_id_is_400(self):
         with self.assertRaises(Exception) as ctx:
             self.send(room="not-a-room")
@@ -560,6 +588,28 @@ class TestFetchPings(ApiBase):
         pings = _attr(response, "pings")
         self.assertEqual(len(pings), 1)
         self.assertEqual(_attr(response, "seq"), 1)
+
+    def test_fetch_room_waiter_cap_returns_empty_200(self):
+        """协议 v1.1 §6：每房间等待者超限 → 立即 200 空数组（不是 429/503）。"""
+        self.use_ping_settings(max_waiters_per_room=1, wait_timeout_seconds=5.0)
+
+        async def scenario():
+            first = asyncio.create_task(
+                api.fetch_pings(ROOM, 0, 5.0, None, self.principal())
+            )
+            await asyncio.sleep(0.02)
+            started = time.monotonic()
+            try:
+                response = await api.fetch_pings(ROOM, 0, 5.0, None, self.principal())
+            finally:
+                first.cancel()
+                await asyncio.gather(first, return_exceptions=True)
+            return response, time.monotonic() - started
+
+        response, elapsed = asyncio.run(scenario())
+        self.assertEqual(_attr(response, "seq"), 0)
+        self.assertEqual(_attr(response, "pings"), [])
+        self.assertLess(elapsed, 0.5)
 
     def test_fetch_global_waiter_cap_is_503_server_busy(self):
         self.use_ping_settings(max_waiters_total=1, wait_timeout_seconds=5.0)

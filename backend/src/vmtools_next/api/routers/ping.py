@@ -24,8 +24,8 @@ ping token 调时装接口同理；``serverId`` 也记录用途，不能跨用�
 容量（默认值，``VMT_PING__*`` 可覆盖，详见 ``docs/后端实现.md``）
 --------------------------------------------------------------
 每房间存活标点 200 ｜ 标点 TTL 20s ｜ 房间空闲回收 60s ｜ 全局房间 1000 ｜
-每房间长轮询等待者 64 ｜ 全局长轮询并发 5000 ｜ 每玩家 5 条 / 3s ｜
-认证 challenge 每 IP 20 次 / 60s。
+每房间长轮询等待者 64（超出**立即返回 200 空数组**）｜ 全局长轮询并发 5000
+（超出 503 ``server_busy``）｜ 每玩家 5 条 / 3s ｜ 认证 challenge 每 IP 20 次 / 60s。
 
 房间被回收后**重建时 ``seq`` 从 0/1 重新开始**（不是全局单调）：客户端用
 ``seq < 本地 lastSeq`` 判定「房间被回收」，重置游标并清空他人标点。
@@ -340,9 +340,10 @@ async def send_ping(
         raise _relay_error(exc)
     if version or body.client_time is not None:
         # 协议 §1：版本头只记日志，不做强校验；clientTime 同样只做诊断
+        # 注意：loguru 用 str.format 风格，占位符数量必须和实参一致（少一个就是 IndexError → 500）
         logger.debug(
             "ping publish version={} clientTime={} room={} seq={} player={}",
-            version or "-", body.client_time, ping.seq, ping.player_name,
+            version or "-", body.client_time, room_id, ping.seq, ping.player_name,
         )
     return PingSendResponse(
         id=ping.id,
