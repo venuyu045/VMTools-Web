@@ -7,7 +7,7 @@
     POST /api/ping/auth/challenge          申请一次性 serverId（TTL 120s，绑定来源 IP）
     POST /api/ping/auth/verify             反查 hasJoined 后签发 token（有效期 24h）
 
-mod（``Authorization: Bearer <token>``，token ``aud="ping"``）::
+mod（``Authorization: Bearer <token>``，token ``aud`` ∈ ``{ping, fashion}``）::
 
     POST /api/ping/rooms/{roomId}/pings    发送标点（201）
     GET  /api/ping/rooms/{roomId}/pings    长轮询拉取（200，最多等 25s）
@@ -15,13 +15,20 @@ mod（``Authorization: Bearer <token>``，token ``aud="ping"``）::
 鉴权
 ----
 复用 ``core/fashion_auth.py`` 的 serverId 挑战表与 hasJoined 校验（**不复制**那套
-逻辑），只有 token 受众不同（``aud="ping"``）。ping token 的 ``sub`` 就是 ``mcUuid``：
-中继是纯内存的，不需要身份表，因此本路由**不依赖 SQLAlchemy Session / 数据库**。
+逻辑）。token 的 ``sub`` 就是 ``mcUuid``：中继是纯内存的，不需要身份表，因此本路由
+**不依赖 SQLAlchemy Session / 数据库**。
 
-两套 token 靠 ``aud`` 隔离：fashion token 调 ping 接口 → 401 ``bad_token``，
-ping token 调时装接口同理；``serverId`` 也记录用途，不能跨用途消费。
+受众（``aud``）策略（v1.2，2026-11-03）
+---------------------------------------
+- **业务路由**（``/rooms/{roomId}/pings``）接受 ``aud="ping"`` **与** ``aud="fashion"``：
+  VMFashion 2.0 合订版把标点功能并入时装 mod 后，客户端复用时装认证拿到的
+  fashion token 调这里，不再走 ping 自己的 challenge/verify。
+- **认证接口**（``/auth/challenge``、``/auth/verify``）**不变**，仍签发 ``aud="ping"``
+  的 token —— 独立 VMPing 0.1.0 客户端照原样认证、发标点，不受影响。
+- **时装路由**仍然只接受 ``aud="fashion"``：ping token 调时装接口依旧 401。
+- ``serverId`` 仍记录用途，不能跨用途消费（ping 的 serverId 换不到 fashion token）。
 
-容量（默认值，``VMT_PING__*`` 可覆盖，详见 ``docs/后端实现.md``）
+容量（默认值，``VMT_PING__*`` 可覆盖，详见 ``docs/ping-api.md``）
 --------------------------------------------------------------
 每房间存活标点 200 ｜ 标点 TTL 20s ｜ 房间空闲回收 60s ｜ 全局房间 1000 ｜
 每房间长轮询等待者 64（超出**立即返回 200 空数组**）｜ 全局长轮询并发 5000
@@ -63,11 +70,12 @@ from vmtools_next.api.schemas.ping import (
 )
 from vmtools_next.core import ping_relay as relay_core
 from vmtools_next.core.fashion_auth import (
+    AUDIENCE_FASHION,
     AUDIENCE_PING,
     FashionAuthError,
     consume_challenge,
     create_challenge,
-    decode_token,
+    decode_token_any,
     issue_token,
     verify_with_session_server,
 )
@@ -75,8 +83,13 @@ from vmtools_next.core.fashion_auth import (
 router = APIRouter(prefix="/api/ping", tags=["ping"])
 _bearer = HTTPBearer(auto_error=False)
 
-#: 本组接口只接受 ``aud="ping"`` 的 token
+#: ``/auth/challenge`` + ``/auth/verify`` 签发（并消费 serverId）的用途。**保持不变**：
+#: 独立 VMPing 0.1.0 客户端仍拿 ``aud="ping"`` 的 token。
 TOKEN_AUDIENCE = AUDIENCE_PING
+
+#: 业务路由（``/rooms/{roomId}/pings``）接受的 token 受众，按尝试顺序：
+#: ``ping`` = 独立 VMPing；``fashion`` = VMFashion 2.0 合订版复用时装 token。
+TOKEN_AUDIENCES = (AUDIENCE_PING, AUDIENCE_FASHION)
 
 
 # ── 统一错误体 ──────────────────────────────────────────────────────────
@@ -177,7 +190,7 @@ def reset_state() -> None:
 
 @dataclass
 class PingPrincipal:
-    """调用者身份：直接来自 ping token 的 claims（中继不需要查库）。"""
+    """调用者身份：直接来自 token 的 claims（``aud`` 为 ``ping`` 或 ``fashion``）。"""
 
     mc_uuid: str
     mc_name: str = ""
@@ -186,16 +199,22 @@ class PingPrincipal:
 def get_ping_principal(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> PingPrincipal:
-    """校验 ``Authorization: Bearer <token>``（``aud="ping"``）。"""
+    """校验 ``Authorization: Bearer <token>``（``aud`` ∈ ``{ping, fashion}``）。
+
+    两种受众都接受：独立 VMPing 用 ``aud="ping"``，VMFashion 2.0 合订版复用
+    ``aud="fashion"``（见 :data:`TOKEN_AUDIENCES`）。签名错 / 过期 / 受众都不匹配
+    一律 ``bad_token``（401，客户端重新认证一次）；只有服务端自己没配好 JWT 密钥
+    才回 ``server_error``（500）—— 多受众尝试**不得**吞掉 ``server_misconfigured``。
+    """
     token = getattr(credentials, "credentials", "") if credentials is not None else ""
     if not token:
         raise _error("unauthorized", "缺少 Authorization: Bearer token", 401)
     try:
-        claims = decode_token(token, audience=TOKEN_AUDIENCE)
+        claims = decode_token_any(token, audiences=TOKEN_AUDIENCES)
     except FashionAuthError as exc:
         if exc.code == "server_misconfigured":
             raise _error("server_error", "服务端未配置 JWT 签名密钥", 500)
-        # 签名错 / 过期 / 受众不是 ping 一律 bad_token：客户端重新认证一次
+        # 签名错 / 过期 / 受众不在 {ping, fashion} 内一律 bad_token：客户端重新认证一次
         raise _error("bad_token", "token 无效或已过期，请重新认证", 401)
     try:
         mc_uuid = relay_core.normalize_uuid(claims.get("mcUuid"))

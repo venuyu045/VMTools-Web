@@ -240,11 +240,37 @@ class TestPrincipal(ApiBase):
             api.get_ping_principal(_Creds(expired))
         self.assertEqual(_http_code(ctx.exception), "bad_token")
 
-    def test_fashion_token_cannot_call_ping(self):
+    def test_fashion_token_can_call_ping(self):
+        """v1.2：VMFashion 2.0 合订版复用时装 token（aud=fashion）调 ping 路由。"""
         fashion_token = self.token(audience=fa.AUDIENCE_FASHION)
+        principal = api.get_ping_principal(_Creds(fashion_token))
+        self.assertEqual(principal.mc_uuid, UUID_A)
+        self.assertEqual(principal.mc_name, "Steve")
+
+    def test_expired_fashion_token_is_401_bad_token(self):
+        expired = self.token(audience=fa.AUDIENCE_FASHION, ttl=-10)
         with self.assertRaises(Exception) as ctx:
-            api.get_ping_principal(_Creds(fashion_token))
+            api.get_ping_principal(_Creds(expired))
         self.assertEqual(_http_code(ctx.exception), "bad_token")
+        self.assertEqual(getattr(ctx.exception, "status_code", None), 401)
+
+    def test_unknown_audience_token_is_401_bad_token(self):
+        """aud 不在 {ping, fashion} 内（如 viewer 的 iframe token）→ bad_token。"""
+        viewer_token = self.token(audience="viewer")
+        with self.assertRaises(Exception) as ctx:
+            api.get_ping_principal(_Creds(viewer_token))
+        self.assertEqual(_http_code(ctx.exception), "bad_token")
+        self.assertEqual(getattr(ctx.exception, "status_code", None), 401)
+
+    def test_server_misconfigured_is_500_server_error(self):
+        """多受众尝试不能把 server_misconfigured 吞成 bad_token。"""
+        self.fake_config = types.SimpleNamespace(
+            fashion=self.fake_config.fashion, ping=self.ping_settings
+        )
+        with self.assertRaises(Exception) as ctx:
+            api.get_ping_principal(_Creds(self.token()))
+        self.assertEqual(_http_code(ctx.exception), "server_error")
+        self.assertEqual(getattr(ctx.exception, "status_code", None), 500)
 
     def test_ping_token_cannot_call_fashion(self):
         ping_token = self.token()
@@ -262,8 +288,48 @@ class TestPrincipal(ApiBase):
         self.assertEqual(principal.mc_uuid, UUID_A)
 
 
-# ── 认证：challenge / verify ───────────────────────────────────────────
+# ── 多受众：时装 token 调 ping 业务路由（v1.2 合订版） ─────────────────
 
+class TestFashionTokenAccess(ApiBase):
+    """VMFashion 2.0 合订版：时装认证拿到的 ``aud="fashion"`` token 直接调 ping 路由。"""
+
+    def fashion_principal(self) -> api.PingPrincipal:
+        return api.get_ping_principal(_Creds(self.token(audience=fa.AUDIENCE_FASHION)))
+
+    def test_fashion_token_send_ping(self):
+        response = self.send(principal=self.fashion_principal())
+        self.assertEqual(_attr(response, "seq"), 1)
+        ping = self.relay.snapshot(ROOM).pings[0]
+        self.assertEqual(ping.player_uuid, UUID_A)
+        self.assertEqual(ping.player_name, "Steve")
+
+    def test_fashion_token_fetch_pings(self):
+        self.send(principal=self.fashion_principal())
+        response = asyncio.run(
+            api.fetch_pings(ROOM, 0, 0, None, self.fashion_principal())
+        )
+        self.assertEqual(len(_attr(response, "pings")), 1)
+        self.assertEqual(_attr(response, "seq"), 1)
+
+    def test_fashion_and_ping_tokens_share_a_room(self):
+        """合订版客户端与独立 VMPing 客户端在同一房间互相可见。"""
+        self.send(principal=self.fashion_principal())
+        self.send(principal=self.principal(mc_uuid=UUID_B, mc_name="Alex"))
+        response = asyncio.run(
+            api.fetch_pings(ROOM, 0, 0, None, self.fashion_principal())
+        )
+        players = {_attr(ping, "player").uuid for ping in _attr(response, "pings")}
+        self.assertEqual(players, {UUID_A, UUID_B})
+
+    def test_ping_token_still_works(self):
+        """回归：独立 VMPing 0.1.0（aud=ping）照旧能发/拉。"""
+        principal = api.get_ping_principal(_Creds(self.token(audience=fa.AUDIENCE_PING)))
+        self.assertEqual(_attr(self.send(principal=principal), "seq"), 1)
+        fetched = asyncio.run(api.fetch_pings(ROOM, 0, 0, None, principal))
+        self.assertEqual(len(_attr(fetched, "pings")), 1)
+
+
+# ── 认证：challenge / verify ───────────────────────────────────────────
 class TestAuthEndpoints(ApiBase):
     def test_challenge_then_verify_issues_ping_token(self):
         challenge = api.auth_challenge(

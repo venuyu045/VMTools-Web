@@ -500,5 +500,27 @@ class TestLoadoutHttp(_HttpBase):
         self.assertEqual(response.json()["items"][0]["scale"], 2.5)
 
 
+class TestPingTokenRejected(_HttpBase):
+    """v1.2：时装路由仍只接受 ``aud=fashion`` —— ping token 调时装接口必须 401。
+
+    ``/api/ping`` 业务路由反过来接受两种受众，但**单向**放宽：独立 VMPing 的
+    ``aud="ping"`` token 不能被时装接口当登录态复用。
+    """
+
+    def test_ping_token_cannot_call_fashion_catalog(self):
+        token, _ttl = fashion_auth.issue_token(
+            MC_UUID, mc_uuid=MC_UUID, mc_name="Steve", audience="ping"
+        )
+        response = self.client.get("/api/fashion/catalog", headers=self.auth_headers(token))
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "invalid_token")
+
+    def test_fashion_token_can_call_fashion_catalog(self):
+        """对照：同一路径用 fashion token 正常（确保上面的 401 是受众判定而非路径问题）。"""
+        _identity, token = self.create_identity()
+        response = self.client.get("/api/fashion/catalog", headers=self.auth_headers(token))
+        self.assertEqual(response.status_code, 200, response.text)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

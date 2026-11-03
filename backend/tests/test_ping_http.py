@@ -179,10 +179,39 @@ class TestPingHttp(unittest.TestCase):
         self.assertEqual(response.status_code, 401, response.text)
         self.assertEqual(response.json()["detail"]["code"], "bad_token")
 
-    def test_fashion_token_cannot_call_ping(self):
+    def test_fashion_token_can_send_and_fetch(self):
+        """v1.2：时装 token（aud=fashion）可发标点并长轮询（VMFashion 2.0 合订版）。"""
+        headers = {"Authorization": f"Bearer {self.issue_token('fashion')}"}
+        sent = self.client.post(
+            f"/api/ping/rooms/{ROOM}/pings", json=self.ping_payload(), headers=headers
+        )
+        self.assertEqual(sent.status_code, 201, sent.text)
+        fetched = self.client.get(
+            f"/api/ping/rooms/{ROOM}/pings?since=0&timeout=0", headers=headers
+        )
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertEqual(
+            fetched.json()["pings"][0]["player"], {"uuid": MC_UUID, "name": MC_NAME}
+        )
+
+    def test_ping_token_still_send_and_fetch(self):
+        """回归：独立 VMPing 0.1.0 的 aud=ping token 行为不变。"""
+        headers = {"Authorization": f"Bearer {self.issue_token('ping')}"}
+        sent = self.client.post(
+            f"/api/ping/rooms/{ROOM}/pings", json=self.ping_payload(), headers=headers
+        )
+        self.assertEqual(sent.status_code, 201, sent.text)
+        fetched = self.client.get(
+            f"/api/ping/rooms/{ROOM}/pings?since=0&timeout=0", headers=headers
+        )
+        self.assertEqual(fetched.status_code, 200, fetched.text)
+        self.assertEqual(len(fetched.json()["pings"]), 1)
+
+    def test_unknown_audience_token_is_401_bad_token(self):
+        """aud 不在 {ping, fashion} 内（如 viewer）仍必须 401 bad_token。"""
         response = self.client.get(
             f"/api/ping/rooms/{ROOM}/pings",
-            headers={"Authorization": f"Bearer {self.issue_token('fashion')}"},
+            headers={"Authorization": f"Bearer {self.issue_token('viewer')}"},
         )
         self.assertEqual(response.status_code, 401, response.text)
         self.assertEqual(response.json()["detail"]["code"], "bad_token")

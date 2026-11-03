@@ -420,6 +420,113 @@ class TestToken(unittest.TestCase):
             fa.decode_token(token, settings=settings, secret=SECRET)
 
 
+class TestDecodeTokenAny(unittest.TestCase):
+    """多受众解码（v1.2）：``/api/ping`` 业务路由同时接受 ``ping`` 与 ``fashion``。"""
+
+    def setUp(self):
+        self.settings = make_settings()
+        self.audiences = (fa.AUDIENCE_PING, fa.AUDIENCE_FASHION)
+
+    def _token(self, audience: str, ttl: int = 3600) -> str:
+        token, _ = fa.issue_token(
+            "identity-1",
+            mc_uuid=UUID_A_DASHED,
+            mc_name="Steve",
+            settings=make_settings(token_ttl_seconds=ttl),
+            secret=SECRET,
+            audience=audience,
+        )
+        return token
+
+    def test_ping_token_accepted(self):
+        claims = fa.decode_token_any(
+            self._token(fa.AUDIENCE_PING),
+            audiences=self.audiences,
+            settings=self.settings,
+            secret=SECRET,
+        )
+        self.assertEqual(claims["aud"], "ping")
+        self.assertEqual(claims["mcUuid"], UUID_A_DASHED)
+
+    def test_fashion_token_accepted(self):
+        claims = fa.decode_token_any(
+            self._token(fa.AUDIENCE_FASHION),
+            audiences=self.audiences,
+            settings=self.settings,
+            secret=SECRET,
+        )
+        self.assertEqual(claims["aud"], "fashion")
+
+    def test_order_and_duplicates_do_not_matter(self):
+        token = self._token(fa.AUDIENCE_FASHION)
+        claims = fa.decode_token_any(
+            token,
+            audiences=(fa.AUDIENCE_FASHION, fa.AUDIENCE_FASHION, fa.AUDIENCE_PING),
+            settings=self.settings,
+            secret=SECRET,
+        )
+        self.assertEqual(claims["aud"], "fashion")
+
+    def test_unknown_audience_rejected(self):
+        with self.assertRaises(fa.FashionAuthError) as ctx:
+            fa.decode_token_any(
+                self._token("viewer"),
+                audiences=self.audiences,
+                settings=self.settings,
+                secret=SECRET,
+            )
+        self.assertEqual(ctx.exception.code, "invalid_token")
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_tampered_token_rejected(self):
+        token = self._token(fa.AUDIENCE_FASHION)
+        with self.assertRaises(fa.FashionAuthError) as ctx:
+            fa.decode_token_any(
+                token[:-2] + "xx",
+                audiences=self.audiences,
+                settings=self.settings,
+                secret=SECRET,
+            )
+        self.assertEqual(ctx.exception.code, "invalid_token")
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_expired_token_rejected(self):
+        with self.assertRaises(fa.FashionAuthError) as ctx:
+            fa.decode_token_any(
+                self._token(fa.AUDIENCE_FASHION, ttl=-10),
+                audiences=self.audiences,
+                settings=self.settings,
+                secret=SECRET,
+            )
+        self.assertEqual(ctx.exception.code, "invalid_token")
+        self.assertEqual(ctx.exception.status_code, 401)
+
+    def test_empty_audiences_rejected(self):
+        with self.assertRaises(fa.FashionAuthError) as ctx:
+            fa.decode_token_any(
+                self._token(fa.AUDIENCE_PING),
+                audiences=(),
+                settings=self.settings,
+                secret=SECRET,
+            )
+        self.assertEqual(ctx.exception.code, "invalid_token")
+
+    def test_server_misconfigured_is_not_swallowed(self):
+        """多受众尝试不得把「服务端没配密钥」吞成 invalid_token。"""
+        import types
+        from unittest.mock import patch
+
+        import vmtools_next.config as config_module
+
+        broken = types.SimpleNamespace()  # 没有 server 段 → _jwt_params 抛错
+        token = self._token(fa.AUDIENCE_FASHION)
+        with patch.object(config_module, "get_config", return_value=broken):
+            with self.assertRaises(fa.FashionAuthError) as ctx:
+                fa.decode_token_any(token, audiences=self.audiences)
+        self.assertEqual(ctx.exception.code, "server_misconfigured")
+        self.assertEqual(ctx.exception.status_code, 500)
+
+
 # ── 设备码 ──────────────────────────────────────────────────────────────
 
 class TestDeviceFlow(unittest.TestCase):

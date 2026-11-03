@@ -23,8 +23,9 @@
   落在白名单内才采用，否则忽略 —— 防 SSRF / 防把 token 送给攻击者域名
 - 所有对外 HTTP 调用 5s 超时；调用失败返回结构化错误，不抛 500
 - 挑战与 token 都带**用途**（``audience``）：``fashion`` / ``ping`` 共用同一套挑战表
-  与 hasJoined 校验，但 ``serverId`` 与 token 都不能跨用途使用（见
-  ``AUDIENCE_FASHION`` / ``AUDIENCE_PING``）。
+  与 hasJoined 校验；``serverId`` 不能跨用途消费，token 默认按用途隔离
+  （唯一例外：``/api/ping`` 的**业务路由**接受 ``ping`` 与 ``fashion`` 两种受众 ——
+  VMFashion 2.0 合订版复用时装 token，见 :func:`decode_token_any`）。
 
 模块不 import ``jwt`` / ``httpx`` 于顶层：两者在离线测试环境没有 stub，且延迟
 导入可以让 import 冒烟在无依赖机器上通过（与 ``api/deps.py`` 的写法一致）。
@@ -36,7 +37,7 @@ import secrets
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 from urllib.parse import urlsplit
 
 # 直接用 loguru 全局 logger（infra.logging 的 get_logger 返回 bind 后的对象，
@@ -49,7 +50,8 @@ AUTH_TYPE_MOJANG = "mojang"
 AUTH_TYPE_YGGDRASIL = "yggdrasil"
 
 # token 受众（JWT ``aud``）。同一套挑战表 / hasJoined 校验被多个 mod 复用，
-# 靠 aud 区分用途：fashion token 不能调 ping 接口，ping token 也不能调时装接口。
+# 靠 aud 区分用途：ping token 不能调时装接口；时装 token 可调 /api/ping 业务路由
+# （VMFashion 2.0 合订版，见 decode_token_any）。
 AUDIENCE_FASHION = "fashion"
 AUDIENCE_PING = "ping"
 
@@ -594,6 +596,50 @@ def decode_token(
     if not isinstance(claims, dict) or not claims.get("sub"):
         raise FashionAuthError("invalid_token", "token 缺少 sub", status_code=401)
     return claims
+
+
+def decode_token_any(
+    token: str,
+    *,
+    audiences: Iterable[str],
+    settings: Any = None,
+    secret: Optional[str] = None,
+) -> dict:
+    """按顺序尝试多个受众解码，返回**第一个**通过的 claims。
+
+    用于「同一组业务路由接受多种用途 token」：``/api/ping`` 的业务路由同时接受
+    ``aud="ping"``（独立 VMPing 0.1.0）与 ``aud="fashion"``（VMFashion 2.0 合订版
+    复用时装 token）。签名密钥相同，靠 ``aud`` 区分用途，因此逐个尝试即可。
+
+    全部受众都失败时统一抛 ``invalid_token``（401），不向调用方暴露「是哪个受众
+    不对」；但 ``server_misconfigured`` 这类**与 token 无关**的错误原样上抛 ——
+    多受众尝试不能把「服务端没配密钥」吞成「客户端 token 过期」。
+
+    Args:
+        token: ``Authorization: Bearer`` 里的 JWT 原文。
+        audiences: 允许的受众，按尝试顺序（空项与重复项自动忽略）。
+        settings / secret: 语义与 :func:`decode_token` 一致（``secret`` 优先）。
+
+    Raises:
+        FashionAuthError: ``invalid_token``（签名错 / 过期 / 受众都不匹配）。
+    """
+    candidates: list[str] = []
+    for audience in audiences or ():
+        aud = str(audience or "").strip()
+        if aud and aud not in candidates:
+            candidates.append(aud)
+
+    last_error: Optional[FashionAuthError] = None
+    for aud in candidates:
+        try:
+            return decode_token(token, settings=settings, secret=secret, audience=aud)
+        except FashionAuthError as exc:
+            if exc.code != "invalid_token":
+                raise
+            last_error = exc
+    raise FashionAuthError(
+        "invalid_token", "token 无效或已过期", status_code=401
+    ) from last_error
 
 
 def decode_web_token(token: str) -> Optional[str]:
