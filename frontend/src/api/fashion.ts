@@ -1,3 +1,4 @@
+import { ElMessage } from 'element-plus'
 import client from './client'
 import type { AxiosProgressEvent } from 'axios'
 
@@ -205,9 +206,19 @@ export type UploadProgressHandler = (e: { loaded: number; total: number }) => vo
  */
 const UPLOAD_TIMEOUT_MS = 120_000
 
-function uploadConfig(file: File, onProgress?: UploadProgressHandler) {
+/**
+ * @param signal 取消句柄：管理端「取消上传」与「关闭上传弹窗」都靠它中止请求。
+ *   没有它时 64MB 的包在慢速上行下要挂到 120s 超时才结束，用户关掉弹窗后
+ *   请求仍在后台跑（进度/错误回调会串到下一次上传）。
+ */
+function uploadConfig(
+  file: File,
+  onProgress?: UploadProgressHandler,
+  signal?: AbortSignal
+) {
   return {
     timeout: UPLOAD_TIMEOUT_MS,
+    ...(signal ? { signal } : {}),
     onUploadProgress: (e: AxiosProgressEvent) => {
       // e.total 在个别环境可能为 undefined/0 → 用 file.size 兜底，保证进度条始终刷新
       if (onProgress) onProgress({ loaded: e.loaded, total: e.total || file.size })
@@ -323,7 +334,8 @@ export const fashionApi = {
    */
   async adminUploadAsset(
     input: { file: File; packId?: string; version?: string; cosmeticId?: string },
-    onProgress?: UploadProgressHandler
+    onProgress?: UploadProgressHandler,
+    signal?: AbortSignal
   ): Promise<AssetUploadResult> {
     const form = new FormData()
     form.append('file', input.file)
@@ -334,14 +346,15 @@ export const fashionApi = {
     const { data } = await client.post<AssetUploadResult>(
       '/fashion/admin/assets',
       form,
-      uploadConfig(input.file, onProgress)
+      uploadConfig(input.file, onProgress, signal)
     )
     return data
   },
   /** 发布时装包（.zip；后端按契约 §6.3 静态校验后立即出现在 GET /packs） */
   async adminUploadPack(
     input: { file: File; packId: string; version: string },
-    onProgress?: UploadProgressHandler
+    onProgress?: UploadProgressHandler,
+    signal?: AbortSignal
   ): Promise<PackUploadResult> {
     const form = new FormData()
     form.append('file', input.file)
@@ -350,7 +363,7 @@ export const fashionApi = {
     const { data } = await client.post<PackUploadResult>(
       '/fashion/admin/packs',
       form,
-      uploadConfig(input.file, onProgress)
+      uploadConfig(input.file, onProgress, signal)
     )
     return data
   },
@@ -408,10 +421,14 @@ export function fashionErrorMessage(error: unknown, fallback = '操作失败'): 
   }
   if (status === 403) return '没有权限执行该操作（403）'
   if (status === 413) return '文件超过 64MB 上限（nginx 直接拒绝），请压缩或拆分后再传'
+  if (status === 422) return '提交的数据格式有误，请检查后重试（422）'
   if (status === 429) {
     const retry = fashionRetryAfter(error)
     return retry ? `操作太频繁，请等待 ${retry} 秒后再试` : '操作太频繁，请稍后再试'
   }
+  // 5xx：反向代理 / nginx 的错误页是 HTML，拿不到 detail → 给中文兜底，
+  // 否则用户只会看到调用方的通用 fallback（如「保存失败」），无从判断是服务端问题
+  if (status >= 500) return '服务器内部错误，请稍后重试（5xx）'
   return fallback
 }
 
@@ -436,4 +453,42 @@ export function fashionRetryAfter(error: unknown): number | null {
   const raw = headers['retry-after'] ?? headers['Retry-After']
   const value = Number(raw)
   return Number.isFinite(value) && value > 0 ? Math.ceil(value) : null
+}
+
+/**
+ * 请求是否被**调用方主动取消**（axios `CanceledError`）。
+ *
+ * 上传弹窗的「取消上传」/「关闭弹窗」都会 abort 请求，此时不该把
+ * 「请求已取消」当成失败弹红条 —— 那是用户自己的操作。
+ */
+export function fashionErrorIsCanceled(error: unknown): boolean {
+  const err = error as { code?: string; name?: string }
+  return err?.code === 'ERR_CANCELED' || err?.name === 'CanceledError'
+}
+
+/**
+ * 这类错误**不需要**再弹第二条提示。
+ *
+ * - 401：`api/client.ts` 的响应拦截器已经统一「清 token + 提示登录已过期 + 跳登录」，
+ *   页面再弹一次就是同一句话叠两条（一个页面并发三个请求时更是一次弹四条）。
+ *   拦截器会在错误对象上打 `authErrorHandled` 标记 —— 只有它**真的**处理过
+ *   才静默；没有 token 的 401（拦截器按设计静默）仍由页面提示，避免页面一片空白
+ *   却什么反馈都没有；
+ * - `ERR_CANCELED`：用户主动取消上传，不是错误。
+ */
+export function isSilentFashionError(error: unknown): boolean {
+  if (fashionErrorIsCanceled(error)) return true
+  const handled = (error as { authErrorHandled?: boolean })?.authErrorHandled
+  return handled === true
+}
+
+/**
+ * 时装页统一错误提示（替代到处写的 `ElMessage.error(fashionErrorMessage(...))`）。
+ *
+ * 与直接调 `ElMessage.error` 的区别只有一处：跳过 401 / 主动取消这两类
+ * 「已有别的反馈」的错误（见 {@link isSilentFashionError}）。
+ */
+export function notifyFashionError(error: unknown, fallback = '操作失败'): void {
+  if (isSilentFashionError(error)) return
+  ElMessage.error(fashionErrorMessage(error, fallback))
 }

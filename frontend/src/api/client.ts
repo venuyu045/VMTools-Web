@@ -34,6 +34,14 @@ client.interceptors.response.use(
       // 访问 guestReadable 只读页（任务中心 / 仪表盘等）时，本应「静默留白」的 401
       // 被误报为「登录已过期」并强制跳转登录页 → 访客只读浏览功能失效。
       const hadToken = !!localStorage.getItem('token')
+      if (hadToken) {
+        // 2026-11-03 审查修复（轻微·重复提示）：
+        // 标记「这个 401 已由拦截器统一处理」，调用方（如时装页的 notifyFashionError）
+        // 据此不再弹第二条同样的「登录已过期」。
+        // 只靠「此时 localStorage 里还有没有 token」判断是不行的 —— 下面
+        // removeItem 在 reject 之前执行，页面 catch 拿到的永远是「没有 token」。
+        ;(error as { authErrorHandled?: boolean }).authErrorHandled = true
+      }
       if (hadToken && !sessionExpiredHandled) {
         sessionExpiredHandled = true
         localStorage.removeItem('token')

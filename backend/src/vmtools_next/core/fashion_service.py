@@ -1095,7 +1095,22 @@ def add_wardrobe_item(db: Any, user_id: str, cosmetic_id: Any) -> tuple[dict, bo
         # 历史行是简单 ID / 另一种形态：就地升级成目录的规范 ID。
         # 不新增行（幂等），但让 /wardrobe/me 逐步收敛到客户端能匹配的全局 ID。
         row.cosmetic_id = stored_id
-        db.commit()
+        try:
+            db.commit()
+        except IntegrityError:
+            # 极端情况：库里同时存在「简单 ID」与「规范 ID」两条同一件（历史并发写入，
+            # 或管理端把目录 ID 从简单形态迁移成全局 ID 后玩家又加了一次）。这时升级
+            # 会撞 (user_id, cosmetic_id) 唯一约束 —— 加入衣柜是幂等接口，不能因此 500：
+            # 回滚保持原样，玩家在列表里删掉多余那条即可。
+            db.rollback()
+            row = next(
+                (
+                    existing
+                    for existing in _wardrobe_rows(db, user_id)
+                    if str(getattr(existing, "cosmetic_id", "")) == stored_id
+                ),
+                row,
+            )
     return (
         _wardrobe_item_dict(
             getattr(row, "cosmetic_id", stored_id),
@@ -1810,13 +1825,37 @@ def delete_pack(db: Any, pack_id: Any, version: Any, *, settings: Any = None) ->
 # ── 资产 ────────────────────────────────────────────────────────────────
 
 def _sanitize_filename(filename: str) -> str:
-    base = Path(str(filename or "")).name
-    base = _FILENAME_SAFE_RE.sub("-", base).strip("-.")
-    if not base:
+    """清洗上传文件名，**保留原始扩展名**。
+
+    为什么不能整体替换：`[^A-Za-z0-9._-] → "-"` 会连扩展名的分隔点一起吃掉 ——
+    中文/带空格的文件名（``深渊龙翼.zip``、``a b.png``）清洗后是 ``-.zip`` →
+    ``strip("-.")`` → ``zip``，扩展名消失，于是被 :func:`_asset_ext` 判成
+    "无扩展名" → ``unsupported_asset_type`` 400（运维只看到"不支持的资产类型"，
+    完全猜不到是文件名语言的问题）。所以先摘出扩展名单独清洗，再拼回去。
+    纯 ASCII 文件名的结果与旧实现完全一致（``dragon.png`` → ``dragon.png``）。
+
+    Raises:
+        FashionServiceError: ``invalid_filename``（清洗后既没有主名也没有扩展名）。
+    """
+    raw = Path(str(filename or "")).name
+    suffix = Path(raw).suffix  # 含点（".zip"）；没有扩展名时为空串
+    stem = raw[: -len(suffix)] if suffix else raw
+    stem = _FILENAME_SAFE_RE.sub("-", stem).strip("-.")
+    ext = _FILENAME_SAFE_RE.sub("", suffix).strip(".-")
+    if not stem and not ext:
         raise FashionServiceError("invalid_filename", "文件名非法")
+    if not ext:
+        base = stem
+    else:
+        # 主名缺失（纯中文文件名）时给个占位，否则只剩 ".png" 这种以点开头的名字
+        base = f"{stem or 'file'}.{ext}"
     if len(base) > 120:
-        stem, dot, ext = base.rpartition(".")
-        base = (stem[:100] + dot + ext) if dot else base[:120]
+        # 扩展名过长（异常文件名）时不再保留它，直接硬截断，保证结果 ≤120
+        if ext and len(ext) < 100:
+            keep = max(1, 120 - len(ext) - 1)
+            base = f"{base[:keep]}.{ext}"
+        else:
+            base = base[:120]
     return base
 
 

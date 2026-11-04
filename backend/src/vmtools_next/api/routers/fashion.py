@@ -50,6 +50,7 @@ mod（Bearer fashion token）::
 from __future__ import annotations
 
 import mimetypes
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -138,6 +139,15 @@ def _rate_limited(message: str, retry_after: int = 60) -> HTTPException:
     )
 
 
+#: 限流表的读-改-写必须串行。这三个限流器被**同步路由**使用，而 FastAPI 会把同步
+#: 路由丢进线程池并发执行：无锁时两个请求可能读到同一份 ``hits`` 快照、各自 append 后
+#: 互相覆盖（丢更新）—— 读到同一份快照 → 多个请求同时放行（绕过限流，device/approve
+#: 的 10/min 是 6 位绑定码的防枚举控制）；写入互相覆盖 → 已计数的命中被抹掉（后续
+#: 合法请求被误拒）。CPython 下这个临界区只有 ~1µs、GIL 5ms 才切一次，现场很难撞上，
+#: 但加锁后「放行数 == limit」才是可证明的，成本只是一次无争用 lock。
+_RATE_LOCK = threading.Lock()
+
+
 def _check_rate(
     store: dict[str, list[float]],
     key: str,
@@ -148,14 +158,15 @@ def _check_rate(
 ) -> None:
     """滑动窗口限流（进程内；多 worker 部署时各进程独立，见 docs §11/§13）。"""
     now = time.monotonic()
-    hits = [t for t in store.get(key, []) if now - t < window]
-    if len(hits) >= limit:
-        raise _rate_limited(message, int(window))
-    hits.append(now)
-    store[key] = hits
-    if len(store) > 5000:  # 防内存膨胀：清掉过期 key
-        for k in [k for k, v in store.items() if not v or now - v[-1] > window]:
-            store.pop(k, None)
+    with _RATE_LOCK:
+        hits = [t for t in store.get(key, []) if now - t < window]
+        if len(hits) >= limit:
+            raise _rate_limited(message, int(window))
+        hits.append(now)
+        store[key] = hits
+        if len(store) > 5000:  # 防内存膨胀：清掉过期 key
+            for k in [k for k, v in store.items() if not v or now - v[-1] > window]:
+                store.pop(k, None)
 
 
 def _check_challenge_rate(key: str) -> None:

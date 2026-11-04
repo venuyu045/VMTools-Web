@@ -1,6 +1,6 @@
 # 标点中继 API（`/api/ping`）—— 后端视角
 
-> 状态：**v1.2**（2026-11-03）｜实现：`backend/src/vmtools_next/api/routers/ping.py` + `backend/src/vmtools_next/core/ping_relay.py` + `core/fashion_auth.py`
+> 状态：**v1.2.1**（2026-11-03）｜实现：`backend/src/vmtools_next/api/routers/ping.py` + `backend/src/vmtools_next/core/ping_relay.py` + `core/fashion_auth.py`
 > 客户端契约全文（房间算法、轮盘、渲染、错误处理）见 VMPing-mod 仓库的 `docs/协议-v1.md`（v1.1）；
 > 本文只记录**后端**侧行为与本次 v1.2 变更，不搬运客户端协议。
 
@@ -65,7 +65,7 @@
 | 每玩家发送 | 5 条 / 3 秒 | 滑动窗口，超限 429 |
 | 每房间存活标点 | 200 | 满 → `room_full` |
 | 标点 TTL | 20 秒 | 惰性清理 |
-| 房间空闲回收 | 60 秒 | 单 worker 内存现实 |
+| 房间空闲回收 | 60 秒 | 无活动且无等待者即回收（`seq` 随之归零）。生产没有周期任务，除「全局房间数打满」外还在**发送路径**上每 64 次兜底扫一遍（v1.2.1） |
 | 全局房间数 | 1000 | |
 | 长轮询等待者 / 房间 | 64 | 超出**立即返回 200 空数组** |
 | 全局长轮询并发 | 5000 | 超出 503 `server_busy` |
@@ -111,6 +111,9 @@ curl -s -o /dev/null -w '%{http_code}\n' \
 
 ## 6. 变更记录
 
+- **v1.2.1（2026-11-03，第 7 轮审查）**：房间空闲回收补上「发送路径每 64 次兜底扫一遍」
+  （此前 `prune()` 只是运维探针、生产从不调用，`room_idle_seconds` 只在全局房间数打满时
+  才生效，被丢下的房间会带着过期标点长期驻留内存）。协议/端点/错误码/受众策略**均无变化**。
 - **v1.2（2026-11-03）**：`/api/ping` 业务路由接受 `aud ∈ {ping, fashion}`（VMFashion 2.0 合订版复用
   时装 token）；`/auth/challenge` + `/auth/verify` 与独立 VMPing 0.1.0 行为不变；时装路由仍只收
   `aud="fashion"`。新增 `fashion_auth.decode_token_any()`。

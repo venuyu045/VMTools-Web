@@ -393,6 +393,52 @@ class TestAddWardrobeItem(_Base):
         self.assertEqual(len(self.rows(USER_A)), 1)
 
 
+    def test_add_upgrade_collision_does_not_500(self):
+        """库里同时存在简单 ID 与规范 ID 两条同一件时，就地升级撞唯一约束不能 500。
+
+        极端场景（历史并发写入，或管理端把目录 ID 从简单形态迁移成全局 ID 后玩家又
+        加了一次）：升级 ``cosmetic_id`` 会撞 ``(user_id, cosmetic_id)`` 唯一约束。
+        加入衣柜是幂等接口 —— 应回滚并返回已存在的那条，而不是把 IntegrityError
+        抛成 500（前端只会看到"服务器错误"，且永远加不进去）。
+        """
+        from sqlalchemy.exc import IntegrityError
+
+        now = datetime.now(timezone.utc)
+        rows = self.db.rows(FashionWardrobeModel)
+        rows.append(
+            FashionWardrobeModel(
+                id="w-legacy", user_id=USER_A, cosmetic_id="cape_dragon", added_at=now
+            )
+        )
+        rows.append(
+            FashionWardrobeModel(
+                id="w-global",
+                user_id=USER_A,
+                cosmetic_id="pack1:cape_dragon",
+                added_at=now,
+            )
+        )
+
+        original_commit = self.db.commit
+        state = {"raised": False}
+
+        def commit():
+            if not state["raised"]:
+                state["raised"] = True
+                raise IntegrityError(
+                    "UPDATE fashion_wardrobe", {}, Exception("UNIQUE constraint failed")
+                )
+            return original_commit()
+
+        self.db.commit = commit
+        item, added = self.add("pack1:cape_dragon")
+
+        self.assertFalse(added, "撞唯一约束时应按「已存在」处理（幂等）")
+        self.assertEqual(item["cosmeticId"], "pack1:cape_dragon")
+        self.assertEqual(len(rows), 2, "不能因为回滚把已有行删掉或新增第三条")
+        self.assertEqual(self.db.rollbacks, 1, "必须回滚失败的升级事务")
+
+
 # ── 衣柜列表 ────────────────────────────────────────────────────────────
 
 class TestListWardrobe(_Base):

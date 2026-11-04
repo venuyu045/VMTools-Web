@@ -415,7 +415,7 @@ class PingSettings(BaseModel):
     room_idle_seconds: float = 60.0
     # 全局房间数上限（超限先回收空闲房间，仍超限返回 429 room_full）
     max_rooms: int = 1000
-    # 每房间长轮询等待者上限（超出 429 room_full）
+    # 每房间长轮询等待者上限（超出**立即返回 200 空数组**，协议 v1.1 §6；不是 429）
     max_waiters_per_room: int = 64
     # 全局长轮询并发上限（跨房间；超出 503 server_busy + Retry-After）。
     # 一个等待者 = 一个挂起中的 HTTP 连接，单进程部署必须给个硬上限。

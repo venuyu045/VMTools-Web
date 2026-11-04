@@ -478,6 +478,25 @@ class TestDecodeTokenAny(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "invalid_token")
         self.assertEqual(ctx.exception.status_code, 401)
 
+    def test_web_token_without_aud_rejected(self):
+        """网页登录 JWT（无 ``aud``）不能当 mod token 用（v1.2 单向放宽的边界）。
+
+        ``/api/ping`` 接受 ping + fashion 两种受众，但网页 JWT 两者都不满足
+        （``jwt.decode(..., audience=...)`` 对缺 ``aud`` 的 token 一律拒绝）。
+        """
+        import jwt
+
+        web_token = jwt.encode({"sub": "user-1"}, SECRET, algorithm="HS256")
+        with self.assertRaises(fa.FashionAuthError) as ctx:
+            fa.decode_token_any(
+                web_token,
+                audiences=self.audiences,
+                settings=self.settings,
+                secret=SECRET,
+            )
+        self.assertEqual(ctx.exception.code, "invalid_token")
+        self.assertEqual(ctx.exception.status_code, 401)
+
     def test_tampered_token_rejected(self):
         token = self._token(fa.AUDIENCE_FASHION)
         with self.assertRaises(fa.FashionAuthError) as ctx:

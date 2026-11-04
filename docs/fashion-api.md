@@ -758,6 +758,12 @@ curl -s -X POST $BASE/loadouts/resolve -H "Authorization: Bearer $TOKEN" -H 'Con
    该目录挂到持久卷，否则重建容器后资产丢失（目录条目还在，下载 404）。
 4. **数据库**：`alembic upgrade head` 建表；`init_db()` 的 `create_all` 也会建
    （迁移是幂等的，重复执行安全）。
+   ⚠️ **老库必须跑一次 `alembic upgrade head`**：`20261103_fashion_asset_idx` 补上了
+   `fashion_asset.storage_path` 的索引。该索引是 2026-11-01「资产下载全表扫描 → 连接池
+   打满 → 全站 504」事故的修复，但 `create_all(checkfirst=True)` **不会给已存在的表补
+   索引**，所以只改模型声明对老库无效（`/assets/{key}` 的回退分支会一直全表扫）。
+   核对：`sqlite3 data/vmtools-next.db ".indexes fashion_asset"` 应能看到
+   `ix_fashion_asset_storage_path`。
 5. **新增皮肤站**：必须同时把 base 加进 `VMT_FASHION__YGGDRASIL_BASES`，否则该站
    玩家会收到 `not_joined`（客户端上报的地址不在白名单会被忽略）。
 6. **限流是进程内的**：challenge / device-approve / device-start 的滑动窗口在单进程内存里，

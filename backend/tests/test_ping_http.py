@@ -216,6 +216,24 @@ class TestPingHttp(unittest.TestCase):
         self.assertEqual(response.status_code, 401, response.text)
         self.assertEqual(response.json()["detail"]["code"], "bad_token")
 
+    def test_web_jwt_without_aud_is_401_bad_token(self):
+        """网页登录 JWT（无 ``aud``）不是 mod token：不能当中继凭据（单向放宽的边界）。
+
+        ``decode_token_any`` 逐个受众调 ``jwt.decode(..., audience=...)``，缺 ``aud``
+        的 token 在每个受众上都失败 → 统一 ``bad_token``，不会因为签名相同就放行。
+        """
+        try:
+            import jwt
+        except Exception:  # pragma: no cover - 离线 stub 环境
+            self.skipTest("需要 PyJWT")
+        web_token = jwt.encode({"sub": "user-1"}, TEST_SECRET_KEY, algorithm="HS256")
+        response = self.client.get(
+            f"/api/ping/rooms/{ROOM}/pings",
+            headers={"Authorization": f"Bearer {web_token}"},
+        )
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "bad_token")
+
     # ── 认证接口 ────────────────────────────────────────────────────────
     def test_auth_challenge_returns_server_id(self):
         response = self.client.post(

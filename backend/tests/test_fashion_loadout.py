@@ -767,6 +767,46 @@ class TestAssets(_Base):
             with self.assertRaises(svc.FashionServiceError):
                 svc.safe_join(self.tmp_path(), bad)
 
+    def test_sanitize_filename_keeps_extension_for_non_ascii_names(self):
+        """中文/带空格的文件名清洗后必须**保留扩展名**。
+
+        回归（v2.0.1 第 7 轮）：旧实现整体把非 ``[A-Za-z0-9._-]`` 替换成 ``-``，
+        ``深渊龙翼.zip`` → ``-.zip`` → ``strip("-.")`` → ``zip``，扩展名被吃掉，
+        上传直接 400 ``unsupported_asset_type``（"不支持的资产类型 (无扩展名)"）。
+        """
+        self.assertEqual(svc._sanitize_filename("深渊龙翼.zip"), "file.zip")
+        self.assertEqual(svc._sanitize_filename("龙翼 披风.PNG"), "file.PNG")
+        self.assertEqual(svc._sanitize_filename("a b.png"), "a-b.png")
+        # 纯 ASCII 文件名行为不变
+        self.assertEqual(svc._sanitize_filename("dragon.png"), "dragon.png")
+        self.assertEqual(svc._sanitize_filename("wings.zip"), "wings.zip")
+        self.assertEqual(svc._sanitize_filename("../../etc/passwd"), "passwd")
+        # 既没有主名也没有扩展名 → invalid_filename（与旧行为一致）
+        for bad in ("翅膀", "", "   ", "///"):
+            with self.subTest(bad=bad):
+                with self.assertRaises(svc.FashionServiceError) as ctx:
+                    svc._sanitize_filename(bad)
+                self.assertEqual(ctx.exception.code, "invalid_filename")
+        # 超长文件名仍截到 120 字符以内且保住扩展名
+        long_name = svc._sanitize_filename("a" * 300 + ".png")
+        self.assertLessEqual(len(long_name), 120)
+        self.assertTrue(long_name.endswith(".png"))
+
+    def test_store_asset_accepts_non_ascii_filename(self):
+        """中文文件名不再被当成"无扩展名"拒绝（.png 走扩展名白名单）。"""
+        data = b"\x89PNG\r\n\x1a\nfake"
+        asset = svc.store_asset(
+            self.db,
+            pack_id="pack1",
+            version="1",
+            filename="龙翼披风.png",
+            data=data,
+            settings=self.settings,
+        )
+        self.assertTrue(asset["storagePath"].endswith(".png"))
+        stored = self.tmp_path() / asset["storagePath"]
+        self.assertTrue(stored.is_file())
+
     def tmp_path(self):
         from pathlib import Path
 
@@ -1224,6 +1264,16 @@ class TestPackManifest(_Base):
         )
         self.assertTrue(asset["storagePath"].endswith(".zip"))
 
+    def test_store_pack_with_non_ascii_filename(self):
+        """中文文件名上传时装包：清洗后必须仍是 ``.zip``（否则被判"无扩展名" 400）。"""
+        data = make_zip({"pack.json": PACK_MANIFEST})
+        asset = svc.store_asset(
+            self.db, pack_id="wings", version="1.2.0", filename="深渊龙翼.zip",
+            data=data, settings=self.settings, pack_zip=True,
+        )
+        self.assertTrue(asset["storagePath"].endswith(".zip"))
+        self.assertEqual(len(svc.list_packs(self.db, settings=self.settings)), 1)
+
     def test_manifest_too_large_rejected(self):
         original = svc.ZIP_MAX_MANIFEST_BYTES
         svc.ZIP_MAX_MANIFEST_BYTES = 4
@@ -1399,6 +1449,98 @@ class TestMigration(unittest.TestCase):
             op.dropped,
             ["fashion_asset", "fashion_loadout", "fashion_catalog", "fashion_identity"],
         )
+
+
+class _IndexOp:
+    """只记录 create_index / drop_index 的 alembic op 替身（storage_path 索引迁移用）。"""
+
+    def __init__(self):
+        self.indexes: list[tuple[str, str, list]] = []
+        self.dropped: list[tuple[str, str]] = []
+
+    def get_bind(self):
+        return object()  # sa.inspect(object()) 会抛 → 迁移按「探测不到」降级
+
+    def create_index(self, name, table, columns, **kwargs):
+        self.indexes.append((name, table, list(columns)))
+
+    def drop_index(self, name, table_name=None, **kwargs):
+        self.dropped.append((name, table_name))
+
+    def create_table(self, *args, **kwargs):  # pragma: no cover - 本迁移不建表
+        raise AssertionError("storage_path 索引迁移不应该建表")
+
+    def drop_table(self, *args, **kwargs):  # pragma: no cover
+        raise AssertionError("storage_path 索引迁移不应该删表")
+
+
+class TestStoragePathIndexMigration(unittest.TestCase):
+    """``ix_fashion_asset_storage_path`` 迁移（第 7 轮审查 M1）。
+
+    背景：``storage_path`` 的 ``index=True`` 是 2026-11-01 事故（§六.106 全表扫描 →
+    连接池打满 → 全站 504）的修复，但 ``create_all`` **不会**给已存在的表补索引，
+    ``20261028_fashion`` 迁移也没建它 —— 于是「先 alembic 建表」的库（含生产）实际
+    上没有这个索引。本用例锁住"必须补上、且幂等"。
+    """
+
+    MIGRATION = os.path.join(
+        _HERE, os.pardir, "alembic", "versions",
+        "20261103_fashion_asset_storage_path_index.py",
+    )
+    INDEX = "ix_fashion_asset_storage_path"
+
+    def _load(self):
+        op = _IndexOp()
+        alembic_stub = types.ModuleType("alembic")
+        alembic_stub.op = op
+        previous = sys.modules.get("alembic")
+        sys.modules["alembic"] = alembic_stub
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "fashion_asset_index_migration_under_test", os.path.abspath(self.MIGRATION)
+            )
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+        finally:
+            if previous is None:
+                sys.modules.pop("alembic", None)
+            else:
+                sys.modules["alembic"] = previous
+        return module, op
+
+    def test_upgrade_creates_index_when_missing(self):
+        module, op = self._load()
+        module.upgrade()  # 探测不到索引（get_bind 是假对象）→ 按缺失处理
+        self.assertEqual(op.indexes, [(self.INDEX, "fashion_asset", ["storage_path"])])
+
+    def test_upgrade_is_idempotent_when_index_exists(self):
+        module, op = self._load()
+        module._index_names = lambda: {self.INDEX}
+        module.upgrade()
+        self.assertEqual(op.indexes, [], "索引已存在时不能重复创建（迁移要可重跑）")
+
+    def test_upgrade_skips_when_table_missing(self):
+        module, op = self._load()
+        module._table_exists = lambda: False
+        module.upgrade()
+        self.assertEqual(op.indexes, [], "表还不存在时由 create_all 建表（自带该索引）")
+
+    def test_revision_graph(self):
+        module, _op = self._load()
+        self.assertEqual(module.revision, "20261103_fashion_asset_idx")
+        self.assertEqual(module.down_revision, "20261101_fashion_wardrobe")
+
+    def test_downgrade_drops_index(self):
+        module, op = self._load()
+        module._index_names = lambda: {self.INDEX}
+        module.downgrade()
+        self.assertEqual(op.dropped, [(self.INDEX, "fashion_asset")])
+
+    def test_downgrade_is_idempotent(self):
+        module, op = self._load()
+        module._index_names = lambda: set()
+        module.downgrade()
+        self.assertEqual(op.dropped, [])
 
 
 if __name__ == "__main__":

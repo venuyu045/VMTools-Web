@@ -40,42 +40,10 @@
       </div>
     </div>
 
-    <el-alert
-      v-if="identitiesError"
-      type="error"
-      show-icon
-      :closable="false"
-      class="no-identity-alert"
-      title="读取 Minecraft 身份失败"
-    >
-      <template #default>
-        <el-button size="small" text type="primary" @click="reloadIdentities">重试</el-button>
-      </template>
-    </el-alert>
-
-    <el-alert
-      v-else-if="noIdentity"
-      type="warning"
-      show-icon
-      :closable="false"
-      class="no-identity-alert"
-      title="当前账号还没有绑定 Minecraft 身份"
-    >
-      <template #default>
-        <p class="no-identity-line">
-          请先到
-          <router-link class="link" to="/fashion/bind">时装绑定</router-link>
-          页输入 mod 显示的 6 位绑定码。
-        </p>
-        <!-- 衣柜收藏是**账号维度**（不是身份维度）：没绑定时左侧列表整块被这里挡住，
-             但商店页仍然能「加入衣柜」。明确告诉用户收藏不会丢，避免他以为白加了。 -->
-        <p class="no-identity-line mono">
-          你在「时装商店」加入衣柜的时装不会丢失 —— 绑定后回到本页即可管理（穿戴 / 移除）。
-        </p>
-      </template>
-    </el-alert>
-
-    <div v-else v-loading="loadingIdentities" class="wardrobe-grid">
+    <!-- 未绑定 / 身份读取失败**不再顶掉整页**：左侧「我的衣柜」是账号维度的收藏
+         （商店页不绑身份也能加入），没绑定时它仍然要能看、能删；提示只替换右侧
+         的「当前穿戴」面板。见 loadout-body 里的同名 alert。 -->
+    <div v-loading="loadingIdentities" class="wardrobe-grid">
       <!-- 左：我的衣柜（收藏制：只有商店里主动「加入衣柜」的时装才在这里） -->
       <el-card shadow="never" class="panel">
         <template #header>
@@ -153,6 +121,9 @@
           </el-radio-group>
           <p v-if="batchMode" class="batch-hint mono" role="status" aria-live="polite">
             批量管理中：点击卡片勾选要移除的时装，再点「删除选中」；按 Esc 可退出。
+            <template v-if="hiddenSelectedCount > 0">
+              另有 {{ hiddenSelectedCount }} 件已勾选的时装不在当前筛选 / 搜索范围内，删除时会一并移除。
+            </template>
           </p>
         </template>
 
@@ -298,61 +269,100 @@
         </template>
 
         <div v-loading="loadingLoadout" class="loadout-body">
+          <!-- 身份读取失败 / 未绑定：只替换右侧「当前穿戴」，左侧收藏照常可用 -->
           <el-alert
-            v-if="loadoutError"
+            v-if="identitiesError"
             class="panel-error"
             type="error"
             :closable="false"
             show-icon
-            title="穿戴配置加载失败"
+            title="读取 Minecraft 身份失败"
           >
             <template #default>
-              <el-button size="small" text type="primary" @click="loadLoadout">重试</el-button>
+              <p class="no-identity-line">暂时读不到绑定信息，左侧「我的衣柜」仍可查看与移除收藏。</p>
+              <el-button size="small" text type="primary" @click="reloadIdentities">重试</el-button>
             </template>
           </el-alert>
-          <div v-for="slot in FASHION_SLOTS" :key="slot.value" class="slot-row">
-            <div class="slot-head">
-              <span class="slot-label">{{ slot.label }}</span>
-              <el-button
-                v-if="slotSelection(slot.value)"
-                size="small"
-                text
-                type="danger"
-                :aria-label="`卸下${slot.label}`"
-                @click="unequip(slot.value)"
-              >
-                卸下
-              </el-button>
+
+          <el-alert
+            v-else-if="noIdentity"
+            class="panel-error"
+            type="warning"
+            :closable="false"
+            show-icon
+            title="当前账号还没有绑定 Minecraft 身份"
+          >
+            <template #default>
+              <p class="no-identity-line">
+                请先到
+                <router-link class="link" to="/fashion/bind">时装绑定</router-link>
+                页输入 mod 显示的 6 位绑定码，绑定后才能在这里选择穿戴并保存。
+              </p>
+              <!-- 衣柜收藏是**账号维度**（不是身份维度）：没绑定时左侧列表照常渲染，
+                   避免用户以为「商店里加的收藏丢了 / 白加了」。 -->
+              <p class="no-identity-line mono">
+                你在「时装商店」加入衣柜的时装不会丢失 —— 左侧就是这份收藏，现在就能查看 / 移除。
+              </p>
+            </template>
+          </el-alert>
+
+          <template v-else>
+            <el-alert
+              v-if="loadoutError"
+              class="panel-error"
+              type="error"
+              :closable="false"
+              show-icon
+              title="穿戴配置加载失败"
+            >
+              <template #default>
+                <el-button size="small" text type="primary" @click="loadLoadout">重试</el-button>
+              </template>
+            </el-alert>
+            <div v-for="slot in FASHION_SLOTS" :key="slot.value" class="slot-row">
+              <div class="slot-head">
+                <span class="slot-label">{{ slot.label }}</span>
+                <el-button
+                  v-if="slotSelection(slot.value)"
+                  size="small"
+                  text
+                  type="danger"
+                  :aria-label="`卸下${slot.label}`"
+                  @click="unequip(slot.value)"
+                >
+                  卸下
+                </el-button>
+              </div>
+
+              <template v-if="slotSelection(slot.value)">
+                <div class="slot-cosmetic">{{ cosmeticName(slot.value) }}</div>
+                <div class="scale-row">
+                  <span class="mono scale-label">缩放</span>
+                  <el-slider
+                    :model-value="slotScale(slot.value)"
+                    :aria-label="`${slot.label}缩放`"
+                    :min="MIN_SCALE"
+                    :max="MAX_SCALE"
+                    :step="0.05"
+                    size="small"
+                    class="scale-slider"
+                    @input="(value: number | number[]) => setScale(slot.value, value)"
+                  />
+                  <span class="mono scale-value">{{ slotScale(slot.value).toFixed(2) }}</span>
+                </div>
+              </template>
+              <div v-else class="slot-empty mono">未穿戴</div>
             </div>
 
-            <template v-if="slotSelection(slot.value)">
-              <div class="slot-cosmetic">{{ cosmeticName(slot.value) }}</div>
-              <div class="scale-row">
-                <span class="mono scale-label">缩放</span>
-                <el-slider
-                  :model-value="slotScale(slot.value)"
-                  :aria-label="`${slot.label}缩放`"
-                  :min="MIN_SCALE"
-                  :max="MAX_SCALE"
-                  :step="0.05"
-                  size="small"
-                  class="scale-slider"
-                  @input="(value: number | number[]) => setScale(slot.value, value)"
-                />
-                <span class="mono scale-value">{{ slotScale(slot.value).toFixed(2) }}</span>
-              </div>
-            </template>
-            <div v-else class="slot-empty mono">未穿戴</div>
-          </div>
-
-          <div class="save-row">
-            <span class="mono save-hint" role="status" aria-live="polite">
-              {{ loadingLoadout ? '正在读取穿戴配置…' : dirty ? '有未保存的修改' : '已与服务器同步' }}
-            </span>
-            <el-button type="primary" :loading="saving" :disabled="saveDisabled" @click="save">
-              保存穿戴
-            </el-button>
-          </div>
+            <div class="save-row">
+              <span class="mono save-hint" role="status" aria-live="polite">
+                {{ loadingLoadout ? '正在读取穿戴配置…' : dirty ? '有未保存的修改' : '已与服务器同步' }}
+              </span>
+              <el-button type="primary" :loading="saving" :disabled="saveDisabled" @click="save">
+                保存穿戴
+              </el-button>
+            </div>
+          </template>
         </div>
       </el-card>
     </div>
@@ -430,6 +440,7 @@ import {
   fashionApi,
   fashionErrorCode,
   fashionErrorMessage,
+  notifyFashionError,
   type FashionIdentity,
   type WardrobeItem,
 } from '@/api/fashion'
@@ -709,6 +720,24 @@ function openDetail(item: WardrobeItem): void {
   detailOpen.value = true
 }
 
+/**
+ * 衣柜列表刷新后，让详情弹窗跟着换成**新数组里的同一个条目**（或关掉）。
+ *
+ * 弹窗持有的是对象引用：不刷新引用时，弹窗里的「加入时间 / 状态」是旧快照，
+ * 条目被移出衣柜后还能对着它点「穿戴」。这里按 cosmeticId 重新定位。
+ */
+function syncDetailWithWardrobe(): void {
+  const current = detailItem.value
+  if (!current) return
+  const fresh = wardrobe.value.find((item) => item.cosmeticId === current.cosmeticId)
+  if (fresh) {
+    detailItem.value = fresh
+    return
+  }
+  detailItem.value = null
+  detailOpen.value = false
+}
+
 function equipFromDetail(): void {
   const item = detailItem.value
   if (!item) return
@@ -854,7 +883,7 @@ async function loadIdentities(): Promise<void> {
   } catch (error) {
     if (seq !== identitiesSeq) return
     identitiesError.value = true
-    ElMessage.error(fashionErrorMessage(error, '读取绑定信息失败'))
+    notifyFashionError(error, '读取绑定信息失败')
   } finally {
     if (seq === identitiesSeq) loadingIdentities.value = false
   }
@@ -891,10 +920,14 @@ async function loadWardrobe(options: { silent?: boolean } = {}): Promise<void> {
     if (wardrobePage.value > maxPage) wardrobePage.value = maxPage
     // 衣柜空了就没有可管理的东西，直接退出批量模式，别让工具栏停在空状态
     if (wardrobe.value.length === 0 && batchMode.value) exitBatchMode()
+    // 详情弹窗持有的是**旧数组里的对象引用**：这件时装已不在衣柜里（本页删 / 别的
+    // 标签页删）时必须关掉弹窗，否则用户还能对着一个已移除的条目点「穿戴」，
+    // 而弹窗里的名称/加入时间也是过期数据
+    syncDetailWithWardrobe()
   } catch (error) {
     if (seq !== wardrobeSeq) return
     wardrobeError.value = true
-    ElMessage.error(fashionErrorMessage(error, '读取我的衣柜失败'))
+    notifyFashionError(error, '读取我的衣柜失败')
   } finally {
     if (seq === wardrobeSeq) loadingWardrobe.value = false
   }
@@ -931,6 +964,21 @@ const filteredIds = computed(() => filteredWardrobe.value.map((item) => item.cos
 const allFilteredSelected = computed(
   () => filteredIds.value.length > 0 && filteredIds.value.every((id) => selectedIds.value.has(id))
 )
+
+/**
+ * 批量模式下「已勾选、但被当前筛选 / 搜索隐藏」的件数。
+ *
+ * 「全选」作用于筛选结果全集（跨分页），勾选也会跨筛选保留 —— 用户切了分类或搜了
+ * 关键词之后，看不见的勾选仍会跟着「删除选中(n)」一起被删。把差额显式说出来，
+ * 避免「我只想删当前这一页」的误操作。
+ */
+const hiddenSelectedCount = computed(() => {
+  if (selectedIds.value.size === 0) return 0
+  const visible = new Set(filteredIds.value)
+  let hidden = 0
+  for (const id of selectedIds.value) if (!visible.has(id)) hidden += 1
+  return hidden
+})
 
 function selectAllFiltered(): void {
   selectedIds.value = new Set(filteredIds.value)
@@ -1014,7 +1062,7 @@ async function removeOne(item: WardrobeItem): Promise<void> {
     }
   } catch (error) {
     // 失败时列表原样保留（没做本地删除），用户可以直接重试
-    ElMessage.error(fashionErrorMessage(error, '移除失败'))
+    notifyFashionError(error, '移除失败')
   } finally {
     const rest = new Set(deletingIds.value)
     rest.delete(item.cosmeticId)
@@ -1091,7 +1139,7 @@ async function batchDelete(): Promise<void> {
       )
     } else {
       // 一件都没删成功：保留勾选，用户可直接重试（不用重新挑一遍）
-      ElMessage.error(fashionErrorMessage(error, '批量移除失败'))
+      notifyFashionError(error, '批量移除失败')
     }
   } finally {
     batchDeleting.value = false
@@ -1170,7 +1218,7 @@ async function loadLoadout(): Promise<void> {
         return
       }
     }
-    ElMessage.error(fashionErrorMessage(error, '读取穿戴配置失败'))
+    notifyFashionError(error, '读取穿戴配置失败')
   } finally {
     if (seq === loadoutSeq) loadingLoadout.value = false
   }
@@ -1273,7 +1321,7 @@ async function save(): Promise<void> {
         return
       }
     }
-    ElMessage.error(fashionErrorMessage(error, '保存失败'))
+    notifyFashionError(error, '保存失败')
   } finally {
     saving.value = false
   }
@@ -1303,8 +1351,15 @@ function applyStoreDeepLink(): void {
   const cosmeticId = typeof route.query.cosmeticId === 'string' ? route.query.cosmeticId : ''
   if (!cosmeticId) return
   const item = wardrobeMap.value.get(cosmeticId) || wardrobeMap.value.get(localIdOf(cosmeticId))
-  if (item) openDetail(item)
-  else ElMessage.info('这件时装还没在你的衣柜里，可到「时装商店」点「加入衣柜」后再来穿戴')
+  if (item) {
+    openDetail(item)
+  } else if (wardrobeError.value) {
+    // 衣柜根本没读到（网络 / 500）：不能断言「这件不在你衣柜里」——
+    // 那是把一次读取失败说成业务结论，用户会以为收藏丢了
+    ElMessage.error('我的衣柜读取失败，暂时无法定位这件时装；可点左侧「刷新」重试')
+  } else {
+    ElMessage.info('这件时装还没在你的衣柜里，可到「时装商店」点「加入衣柜」后再来穿戴')
+  }
   const query = { ...route.query }
   delete query.cosmeticId
   void router.replace({ query })
@@ -1394,11 +1449,9 @@ onBeforeRouteLeave(async () => {
   background: var(--bg-elevated);
 }
 
-.no-identity-alert {
-  margin-bottom: var(--space-4);
-}
-
-/* 未绑定身份时的两行说明：第一行给操作路径，第二行说明收藏不会丢 */
+/* 未绑定 / 身份读取失败时的说明：第一行给操作路径，第二行说明收藏不会丢。
+   提示现在只出现在右侧「当前穿戴」卡片里（左侧衣柜列表照常可用），
+   所以不再需要原来的整页 alert 外边距。 */
 .no-identity-line {
   margin: 0;
   line-height: 1.8;

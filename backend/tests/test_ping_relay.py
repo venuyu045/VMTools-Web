@@ -317,6 +317,32 @@ class TestRoomLifecycle(unittest.TestCase):
         fixture.relay.reset()
         self.assertEqual(fixture.relay.stats(), {"rooms": 0, "pings": 0, "waiters": 0})
 
+    def test_idle_room_is_reclaimed_on_publish_path(self):
+        """生产没有周期任务：发送路径每 ``PRUNE_EVERY_PUBLISHES`` 次兜底回收空闲房间。
+
+        回归（v2.0.1 第 7 轮 L1）：``prune()`` 只是运维/单测探针，从未被生产代码调用，
+        于是 ``room_idle_seconds`` 只在「全局房间数打满、要建新房间」时才生效 ——
+        被丢下的房间会带着已过期的标点长期驻留内存（上限 1000 房间 × 200 标点）。
+        """
+        fixture = RelayFixture(room_idle_seconds=60.0)
+        fixture.publish(room=ROOM_B)  # 被丢下的房间
+        fixture.clock.advance(61)  # 超过空闲阈值
+        for _ in range(relay.PRUNE_EVERY_PUBLISHES):
+            fixture.publish(room=ROOM_A)  # 另一个房间继续活动
+        self.assertEqual(fixture.relay.stats()["rooms"], 1, "空闲房间应被兜底回收")
+        self.assertEqual(fixture.relay.snapshot(ROOM_A).seq, relay.PRUNE_EVERY_PUBLISHES)
+
+    def test_publish_path_prune_keeps_active_room_seq(self):
+        """兜底回收不能误伤当前房间（误回收会让 seq 归零，客户端当成房间被回收）。"""
+        fixture = RelayFixture(room_idle_seconds=60.0)
+        fixture.publish(room=ROOM_A)
+        fixture.clock.advance(61)
+        last = None
+        for _ in range(relay.PRUNE_EVERY_PUBLISHES):
+            last = fixture.publish(room=ROOM_A)
+        self.assertEqual(fixture.relay.stats()["rooms"], 1)
+        self.assertEqual(last.seq, 1 + relay.PRUNE_EVERY_PUBLISHES)
+
 
 # ── 长轮询 ──────────────────────────────────────────────────────────────
 

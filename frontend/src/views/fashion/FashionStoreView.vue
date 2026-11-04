@@ -215,7 +215,7 @@ import {
   CATEGORY_LABELS,
   FASHION_SLOTS,
   fashionApi,
-  fashionErrorMessage,
+  notifyFashionError,
   type CatalogItem,
 } from '@/api/fashion'
 
@@ -400,7 +400,7 @@ async function addToWardrobe(item: CatalogItem): Promise<void> {
     if (data.added) ElMessage.success(`已把「${displayName(item)}」加入衣柜`)
     else ElMessage.info(`「${displayName(item)}」已经在你的衣柜里了`)
   } catch (error) {
-    ElMessage.error(fashionErrorMessage(error, '加入衣柜失败'))
+    notifyFashionError(error, '加入衣柜失败')
   } finally {
     const rest = new Set(addingIds.value)
     rest.delete(cosmeticId)
@@ -434,7 +434,7 @@ async function loadWardrobe(): Promise<void> {
   } catch (error) {
     if (seq !== wardrobeSeq) return
     wardrobeError.value = true
-    ElMessage.error(fashionErrorMessage(error, '读取我的衣柜失败'))
+    notifyFashionError(error, '读取我的衣柜失败')
   } finally {
     if (seq === wardrobeSeq) loadingWardrobe.value = false
   }
@@ -460,7 +460,7 @@ async function loadCatalog(): Promise<void> {
   } catch (error) {
     if (seq !== catalogSeq) return
     loadError.value = true
-    ElMessage.error(fashionErrorMessage(error, '读取时装目录失败'))
+    notifyFashionError(error, '读取时装目录失败')
   } finally {
     if (seq === catalogSeq) loading.value = false
   }

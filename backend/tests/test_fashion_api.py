@@ -18,6 +18,7 @@ import io
 import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 import zipfile
@@ -857,6 +858,72 @@ class TestUploadHardening(ApiBase):
             api.auth_challenge(body, _Request())
         self.assertEqual(_http_code(ctx.exception), "rate_limited")
         self.assertEqual(getattr(ctx.exception, "headers", {}).get("Retry-After"), "60")
+
+
+class TestRateLimiterAtomicity(unittest.TestCase):
+    """限流表的读-改-写必须原子（第 7 轮审查 L3）。
+
+    三个限流器（challenge / device-approve / device-start）挂在**同步路由**上，
+    FastAPI 把它们丢进线程池并发执行。旧实现无锁：并发请求可能读到同一份 ``hits``
+    快照，各自 append 后互相覆盖（丢更新）—— 放行数与记录数都会偏离 ``limit``：
+    读到同一份快照 → 多个请求同时放行（绕过限流，``device/approve`` 的 10/min 是 6 位
+    绑定码的防枚举控制）；写入互相覆盖 → 已计数的命中被抹掉（后续合法请求被误拒）。
+
+    CPython 下这个临界区只有 ~1µs，而 GIL 默认 5ms 才切一次，真实现场很难撞上；
+    本用例用一个**人为放慢的 store**（get/setitem 各 sleep 2ms）把窗口放大到必然命中，
+    从而确定性地锁住「放行数 == limit 且记录数 == limit」这个不变量（实测把锁换成
+    no-op 后 12 并发只放行 1 条、记录 1 条 —— 正是丢更新的表现）。
+    """
+
+    class _SlowStore(dict):
+        """把读/写各放慢 2ms，放大竞态窗口（仅测试用）。"""
+
+        DELAY = 0.002
+
+        def get(self, key, default=None):
+            value = super().get(key, default)
+            time.sleep(self.DELAY)
+            return value
+
+        def __setitem__(self, key, value):
+            time.sleep(self.DELAY)
+            super().__setitem__(key, value)
+
+    def test_concurrent_checks_never_exceed_limit(self):
+        import threading
+
+        limit = 4
+        workers = 12
+        for round_index in range(3):
+            store = self._SlowStore()
+            barrier = threading.Barrier(workers)
+            results: list[str] = []
+            lock = threading.Lock()
+
+            def worker():
+                barrier.wait()
+                try:
+                    api._check_rate(
+                        store, "k", window=60.0, limit=limit, message="太频繁"
+                    )
+                    outcome = "ok"
+                except Exception:
+                    outcome = "limited"
+                with lock:
+                    results.append(outcome)
+
+            threads = [threading.Thread(target=worker) for _ in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+            with self.subTest(round=round_index):
+                self.assertEqual(
+                    results.count("ok"), limit,
+                    f"并发下放行的请求数必须正好是 {limit}（丢更新会让它偏离）",
+                )
+                self.assertEqual(len(store["k"]), limit)
 
 
 if __name__ == "__main__":

@@ -187,6 +187,8 @@ import {
   fashionErrorCode,
   fashionErrorMessage,
   fashionRetryAfter,
+  isSilentFashionError,
+  notifyFashionError,
   type DeviceApproveResult,
   type FashionIdentity,
 } from '@/api/fashion'
@@ -244,7 +246,7 @@ async function loadIdentities(): Promise<void> {
   } catch (error) {
     if (seq !== identitiesSeq) return
     identitiesError.value = true
-    ElMessage.error(fashionErrorMessage(error, '读取绑定信息失败'))
+    notifyFashionError(error, '读取绑定信息失败')
   } finally {
     if (seq === identitiesSeq) loadingIdentities.value = false
   }
@@ -265,7 +267,8 @@ async function handleApprove(): Promise<void> {
     ElMessage.success(`绑定成功：${data.mcName}`)
     await loadIdentities()
   } catch (error) {
-    ElMessage.error(approveErrorMessage(error))
+    // 401 已由 api/client.ts 拦截器统一提示 + 跳登录；主动取消不是错误
+    if (!isSilentFashionError(error)) ElMessage.error(approveErrorMessage(error))
   } finally {
     approving.value = false
   }
@@ -293,7 +296,7 @@ async function handleUnbind(identity: FashionIdentity): Promise<void> {
       ElMessage.success('已解绑')
     }
   } catch (error) {
-    ElMessage.error(fashionErrorMessage(error, '解绑失败'))
+    notifyFashionError(error, '解绑失败')
   } finally {
     unbindingId.value = ''
   }

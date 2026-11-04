@@ -521,6 +521,27 @@ class TestPingTokenRejected(_HttpBase):
         response = self.client.get("/api/fashion/catalog", headers=self.auth_headers(token))
         self.assertEqual(response.status_code, 200, response.text)
 
+    def test_ping_token_cannot_call_wardrobe_me(self):
+        """``GET /wardrobe/me`` 走 ``get_principal``（时装 token 或网页 JWT）：
+        ping token 既不是 fashion token（aud 不符）也不是网页 JWT（带 aud），必须 401。"""
+        token, _ttl = fashion_auth.issue_token(
+            MC_UUID, mc_uuid=MC_UUID, mc_name="Steve", audience="ping"
+        )
+        response = self.client.get(
+            "/api/fashion/wardrobe/me", headers=self.auth_headers(token)
+        )
+        self.assertEqual(response.status_code, 401, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "invalid_token")
+
+    def test_fashion_token_can_call_wardrobe_me(self):
+        """对照：fashion token 拉衣柜正常；未绑定网站账号 → ``linked=false``（200 不是错误）。"""
+        _identity, token = self.create_identity()
+        response = self.client.get(
+            "/api/fashion/wardrobe/me", headers=self.auth_headers(token)
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json(), {"linked": False, "items": []})
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

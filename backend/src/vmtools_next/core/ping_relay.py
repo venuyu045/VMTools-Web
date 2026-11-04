@@ -34,6 +34,10 @@
 每玩家发送                 5 条 / 3s  滑动窗口，超出 ``rate_limited``（429 + Retry-After）
 =========================  =========  ==============================================
 
+清理时机：TTL 与空闲回收都是**惰性**的（房间被访问时才扫）。生产没有周期任务，所以
+空闲回收除「全局房间数打满」外，还在发送路径上每 :data:`PRUNE_EVERY_PUBLISHES` 次
+兜底扫一遍，避免被丢下的房间带着过期标点长期驻留内存。
+
 并发模型（单进程）
 ------------------
 状态用 ``threading.RLock`` 保护：临界区只有纯内存的 O(1) / O(n≤200) 操作，没有任何
@@ -100,6 +104,16 @@ DEFAULT_MAX_WAIT_TIMEOUT_SECONDS = 25.0
 DEFAULT_TOKEN_TTL_SECONDS = 86400
 DEFAULT_CHALLENGE_RATE_LIMIT = 20
 DEFAULT_CHALLENGE_RATE_WINDOW_SECONDS = 60.0
+
+#: 发送路径每 N 次顺带回收一次空闲房间。
+#:
+#: 生产没有周期任务（``prune()`` 只是运维/单测探针），而 TTL 清理是惰性的：房间被
+#: 丢下后既没人 publish 也没人 poll，就永远不会被扫到 —— ``room_idle_seconds`` 只在
+#: 「全局房间数打满、要建新房间」时才生效，空闲房间会带着已过期的标点长期驻留内存
+#: （上限 1000 房间 × 200 标点）。这里在发送路径上按固定频率兜底扫一遍：当前房间刚
+#: 更新过 ``last_active``，这一轮不会被误回收；每次扫描是 O(房间数 ≤ 1000) 的纯内存
+#: 遍历，摊到 64 次请求上可忽略。
+PRUNE_EVERY_PUBLISHES = 64
 
 
 # ── 错误 ────────────────────────────────────────────────────────────────
@@ -456,6 +470,8 @@ class PingRelay:
         self._limiter = SlidingWindowLimiter(
             self.config.rate_limit, self.config.rate_window_seconds
         )
+        #: 发送次数计数（触发 PRUNE_EVERY_PUBLISHES 的空闲房间兜底回收）
+        self._publish_count = 0
 
     # ── 构造 ────────────────────────────────────────────────────────────
     @classmethod
@@ -543,6 +559,11 @@ class PingRelay:
             )
             room.pings.append(ping)
             room.last_active = now
+            self._publish_count += 1
+            if self._publish_count % PRUNE_EVERY_PUBLISHES == 0:
+                # 兜底回收空闲房间（见 PRUNE_EVERY_PUBLISHES 的说明）。
+                # 当前房间刚更新过 last_active，不会被这一轮回收。
+                self._prune_idle_rooms_locked(now)
             waiters = list(room.waiters)
         # 锁外唤醒：唤醒回调可能触发等待者所在线程的调度，别在临界区里做
         for waiter in waiters:

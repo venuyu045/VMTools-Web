@@ -197,18 +197,18 @@
                   placeholder="按 packId 过滤"
                   aria-label="按 packId 过滤资产"
                   class="search-input"
-                  @change="loadAssets"
+                  @change="onAssetFilterChange"
                 />
               </div>
               <div class="toolbar-right">
-                <span class="count-hint mono">{{ assets.length }} 个资产</span>
+                <span class="count-hint mono">{{ assets.length }} 个资产（按 50 条/页）</span>
                 <el-button size="small" type="primary" @click="openAssetDialog">上传资产</el-button>
               </div>
             </div>
 
             <el-table
               v-loading="assetLoading"
-              :data="assets"
+              :data="pagedAssets"
               size="small"
               stripe
               class="admin-table"
@@ -263,6 +263,16 @@
                 </template>
               </el-table-column>
             </el-table>
+
+            <div v-if="assets.length > assetPageSize" class="pane-footer">
+              <el-pagination
+                layout="prev, pager, next"
+                :total="assets.length"
+                :page-size="assetPageSize"
+                :current-page="assetPage"
+                @current-change="assetPage = $event"
+              />
+            </div>
 
             <p class="pane-hint mono">
               后端目前没有删除资产的接口（只有 GET / POST /admin/assets），文件只能由运维在资产目录里清理。
@@ -466,6 +476,9 @@
               <span>{{ fmtBytes(upload.loaded) }} / {{ fmtBytes(upload.total) }}</span>
               <span v-if="upload.speedKBps > 0">· {{ fmtSpeed(upload.speedKBps) }}</span>
               <span v-if="upload.etaSec !== null">· 剩余 {{ fmtEta(upload.etaSec) }}</span>
+              <el-button size="small" text type="danger" class="upload-cancel" @click="cancelUpload">
+                取消上传
+              </el-button>
             </div>
           </div>
           <p v-if="upload.error" class="upload-error">{{ upload.error }}</p>
@@ -513,6 +526,9 @@
               <span>{{ fmtBytes(upload.loaded) }} / {{ fmtBytes(upload.total) }}</span>
               <span v-if="upload.speedKBps > 0">· {{ fmtSpeed(upload.speedKBps) }}</span>
               <span v-if="upload.etaSec !== null">· 剩余 {{ fmtEta(upload.etaSec) }}</span>
+              <el-button size="small" text type="danger" class="upload-cancel" @click="cancelUpload">
+                取消上传
+              </el-button>
             </div>
           </div>
           <p v-if="upload.error" class="upload-error">{{ upload.error }}</p>
@@ -540,7 +556,9 @@ import {
   fashionApi,
   fashionErrorCode,
   fashionErrorMessage,
+  fashionErrorIsCanceled,
   fashionErrorStatus,
+  isSilentFashionError,
   type AdminCatalogItem,
   type CatalogUpsertPayload,
   type FashionAsset,
@@ -615,6 +633,21 @@ const assetPackFilter = ref('')
 const assetDialog = reactive({ visible: false })
 const assetForm = reactive({ packId: 'default', version: '1', cosmeticId: '' })
 
+/**
+ * 资产表分页。
+ *
+ * `GET /admin/assets` 没有分页参数、一次返回全量，而生产资产表可以到 5000+ 行
+ * （每件时装的贴图 / 模型 / 音频各一行）。`el-table` 不做虚拟滚动，且挂载时
+ * 三个 tab 的内容都会渲染 —— 一次性铺 5000 行会直接把管理页卡死（每行还有一个
+ * 缩略图请求）。这里按 50 条前端分页，和「目录管理」同一套页码夹紧规则。
+ */
+const assetPage = ref(1)
+const assetPageSize = 50
+const pagedAssets = computed(() => {
+  const start = (assetPage.value - 1) * assetPageSize
+  return assets.value.slice(start, start + assetPageSize)
+})
+
 // ────────────────────── 时装包 ──────────────────────
 const packs = ref<FashionPack[]>([])
 const packLoading = ref(false)
@@ -659,6 +692,18 @@ const upload = reactive<UploadState>({
 })
 let lastLoaded = 0
 let lastTime = 0
+/**
+ * 每次上传的序号 + 取消句柄。
+ *
+ * 两个上传弹窗（资产 / 时装包）**共用同一份 `upload` 状态**，而且关闭弹窗时请求
+ * 并不会自己停下 —— 没有这两个东西时，旧请求的 `onUploadProgress` 会继续往同一份
+ * 状态里写：进度在两个请求之间来回跳、错误文案出现在另一个弹窗里，用户关掉弹窗
+ * 后请求还要挂到 120s 超时才结束。现在：
+ * - `uploadSeq`：只有「当前这次上传」的回调才允许改 `upload` / 弹结果提示；
+ * - `uploadAbort`：取消按钮 / 关闭弹窗时真正 abort 请求（axios `signal`）。
+ */
+let uploadSeq = 0
+let uploadAbort: AbortController | null = null
 
 /** nginx `client_max_body_size 64m` 与后端 MAX_ASSET_BYTES 相等 → 恰好 64MB 会被 nginx 用 HTML 413 拒掉 */
 const MAX_UPLOAD_BYTES = 64 * 1024 * 1024
@@ -762,20 +807,40 @@ function adminErrorMessage(error: unknown, fallback: string): string {
   return fashionErrorMessage(error, fallback)
 }
 
+/**
+ * 统一的错误 toast（本页所有 catch 都走它）。
+ *
+ * 与直接 `ElMessage.error(adminErrorMessage(...))` 的区别：401（登录过期）由
+ * `api/client.ts` 拦截器统一提示并跳登录、主动取消（`ERR_CANCELED`）不是错误，
+ * 这两类不再重复弹。
+ */
+function notifyAdminError(error: unknown, fallback: string): void {
+  if (isSilentFashionError(error)) return
+  ElMessage.error(adminErrorMessage(error, fallback))
+}
+
 /** 列表加载失败：403 时切到「无权限」页，其余给 toast（避免一次挂载弹三条重复错误） */
 function handleLoadError(error: unknown, fallback: string): void {
   if (fashionErrorStatus(error) === 403) {
     forbidden.value = true
     return
   }
-  ElMessage.error(adminErrorMessage(error, fallback))
+  notifyAdminError(error, fallback)
 }
 
 // ────────────────────── 加载 ──────────────────────
+// 请求竞态保护：连点「刷新」、改筛选、上传成功后回读，都可能并发同一个 loader；
+// 没有序号时旧响应会覆盖新响应（例如刚按 packId 过滤完，又被一次全量响应刷回全部）。
+let catalogSeq = 0
+let assetSeq = 0
+let packSeq = 0
+
 async function loadCatalog(): Promise<void> {
+  const seq = ++catalogSeq
   catalogLoading.value = true
   try {
     const { data } = await fashionApi.adminCatalog()
+    if (seq !== catalogSeq) return
     catalogRows.value = data.items || []
     // 与衣柜页同一条规则：目录重新拉成功 = 资产可能已补齐，缩略图要重试一次
     brokenThumbs.value = new Set()
@@ -783,36 +848,52 @@ async function loadCatalog(): Promise<void> {
     const maxPage = Math.max(1, Math.ceil(filteredCatalogRows.value.length / pageSize))
     if (catalogPage.value > maxPage) catalogPage.value = maxPage
   } catch (error) {
+    if (seq !== catalogSeq) return
     handleLoadError(error, '读取时装目录失败')
   } finally {
-    catalogLoading.value = false
+    if (seq === catalogSeq) catalogLoading.value = false
   }
 }
 
 async function loadAssets(): Promise<void> {
+  const seq = ++assetSeq
   assetLoading.value = true
   try {
     const { data } = await fashionApi.adminAssets(
       assetPackFilter.value.trim() ? { pack_id: assetPackFilter.value.trim() } : undefined
     )
+    if (seq !== assetSeq) return
     assets.value = data.items || []
+    // 过滤 / 回读后条数变少时夹紧页码，避免停在空页（与目录管理同一规则）
+    const maxPage = Math.max(1, Math.ceil(assets.value.length / assetPageSize))
+    if (assetPage.value > maxPage) assetPage.value = maxPage
   } catch (error) {
+    if (seq !== assetSeq) return
     handleLoadError(error, '读取资产列表失败')
   } finally {
-    assetLoading.value = false
+    if (seq === assetSeq) assetLoading.value = false
   }
 }
 
 async function loadPacks(): Promise<void> {
+  const seq = ++packSeq
   packLoading.value = true
   try {
     const { data } = await fashionApi.packs()
+    if (seq !== packSeq) return
     packs.value = data.packs || []
   } catch (error) {
+    if (seq !== packSeq) return
     handleLoadError(error, '读取时装包清单失败')
   } finally {
-    packLoading.value = false
+    if (seq === packSeq) packLoading.value = false
   }
+}
+
+/** 资产页按 packId 过滤：输入框 change（回车 / 失焦）才发请求，并回到第 1 页 */
+async function onAssetFilterChange(): Promise<void> {
+  assetPage.value = 1
+  await loadAssets()
 }
 
 async function refreshActive(): Promise<void> {
@@ -880,6 +961,29 @@ function buildCatalogPayload(): CatalogUpsertPayload {
 }
 
 /**
+ * 「时装包」字段本身的校验：与后端 `is_safe_pack_id` 对齐（空值合法 = 不指定包）。
+ *
+ * 为什么必须单独校验：`validate_cosmetic_id` 只在**全局 ID**（带冒号）时才检查
+ * 前缀，而 `packId` 字段无论 ID 形态都会过一遍 `is_safe_pack_id`。只在冒号分支里
+ * 校验前缀，会漏掉「简单 ID + 非法 packId」这一路（例如填了 `server` 或 `.tmp`），
+ * 管理员仍要吃一次 400 `invalid_pack_id` 才知道。
+ */
+function validatePackIdField(packId: string): string {
+  if (!packId) return ''
+  if (!/^[A-Za-z0-9._-]{1,64}$/.test(packId)) {
+    return '「时装包」只允许字母/数字/._-，长度 1-64'
+  }
+  if (packId === '.' || packId === '..' || packId.startsWith('.')) {
+    return '「时装包」不能是 . / .. 或以点开头（客户端会把点开头的包当临时目录清理）'
+  }
+  // 后端是 value.lower() in {"server"}：大小写不敏感，Server / SERVER 同样被拒
+  if (packId.toLowerCase() === 'server') {
+    return '「时装包」不能叫 server（客户端保留名）'
+  }
+  return ''
+}
+
+/**
  * 目录表单的前端预校验：与后端 `core/fashion_service.py:validate_cosmetic_id` 对齐。
  *
  * 为什么不能只靠后端：`invalid_cosmetic_id` 的 5 种原因里，管理员最常踩的是
@@ -894,6 +998,9 @@ function validateCatalogCosmeticId(cosmeticId: string, packId: string): string {
   if (!/^[A-Za-z0-9._:-]{1,128}$/.test(cosmeticId)) {
     return 'cosmeticId 只允许字母/数字/._:-，长度 ≤128'
   }
+  // 先校验「时装包」字段（后端顺序也是先 cid 格式、再 is_safe_pack_id(pid)）
+  const packIdError = validatePackIdField(packId)
+  if (packIdError) return packIdError
   const colons = (cosmeticId.match(/:/g) || []).length
   if (colons === 0) return '' // 历史简单 ID：接受（legacy），packId 独立生效
   if (colons > 1) return 'cosmeticId 只能有一个冒号（形如 <packId>:<localId>）'
@@ -901,7 +1008,13 @@ function validateCatalogCosmeticId(cosmeticId: string, packId: string): string {
   const prefix = rawPrefix.trim()
   const local = rawLocal.trim()
   if (!prefix || !local) return 'cosmeticId 形如 <packId>:<localId>，冒号两段都不能为空'
-  if (!/^[A-Za-z0-9._-]{1,64}$/.test(prefix) || prefix === '.' || prefix === '..' || prefix === 'server' || prefix.startsWith('.')) {
+  if (
+    !/^[A-Za-z0-9._-]{1,64}$/.test(prefix) ||
+    prefix === '.' ||
+    prefix === '..' ||
+    prefix.toLowerCase() === 'server' ||
+    prefix.startsWith('.')
+  ) {
     return `cosmeticId 的包前缀「${prefix}」不能当目录名：只允许字母/数字/._-，长度 1-64，且不能是 . / .. / server / 点开头`
   }
   if (!/^[A-Za-z0-9._-]{1,96}$/.test(local)) {
@@ -939,7 +1052,7 @@ async function saveCatalog(): Promise<void> {
     }
     catalogDialog.visible = false
   } catch (error) {
-    ElMessage.error(adminErrorMessage(error, '保存失败'))
+    notifyAdminError(error, '保存失败')
   } finally {
     catalogDialog.saving = false
   }
@@ -954,7 +1067,7 @@ async function toggleEnabled(row: AdminCatalogItem, value: string | number | boo
     Object.assign(row, data)
     ElMessage.success(next ? '已上架' : '已下架')
   } catch (error) {
-    ElMessage.error(adminErrorMessage(error, '切换上下架失败'))
+    notifyAdminError(error, '切换上下架失败')
   } finally {
     togglingId.value = ''
   }
@@ -981,12 +1094,22 @@ async function removeCatalog(row: AdminCatalogItem): Promise<void> {
     if (catalogPage.value > maxPage) catalogPage.value = maxPage
     ElMessage.success('已删除')
   } catch (error) {
-    ElMessage.error(adminErrorMessage(error, '删除失败'))
+    notifyAdminError(error, '删除失败')
   }
 }
 
 // ────────────────────── 上传 ──────────────────────
+/**
+ * 清空上传状态，并**作废进行中的请求**。
+ *
+ * `uploadSeq++` 是关键：调用它的地方（关闭弹窗 / 打开另一个上传弹窗 / 取消）
+ * 之后，仍在飞的那次上传的回调会被 `seq !== uploadSeq` 挡掉，不会把进度和结果
+ * 写进已经属于「下一次上传」的状态里。
+ */
 function resetUpload(): void {
+  uploadSeq++
+  uploadAbort?.abort()
+  uploadAbort = null
   upload.active = false
   upload.percent = 0
   upload.loaded = 0
@@ -998,30 +1121,43 @@ function resetUpload(): void {
   lastTime = 0
 }
 
-function startUpload(total: number): void {
+/** 开始一次上传，返回本次上传的序号（用于判定回调是否仍属当前上传） */
+function startUpload(total: number): number {
   resetUpload()
+  const seq = uploadSeq
   upload.active = true
   upload.total = total
   lastTime = performance.now()
+  uploadAbort = new AbortController()
+  return seq
 }
 
-function onUploadTick(event: { loaded: number; total: number }): void {
-  const now = performance.now()
-  const dt = (now - lastTime) / 1000
-  upload.loaded = event.loaded
-  if (event.total) upload.total = event.total
-  if (dt > 0.15) {
-    const delta = event.loaded - lastLoaded
-    upload.speedKBps = delta > 0 ? delta / 1024 / dt : upload.speedKBps * 0.9
-    lastLoaded = event.loaded
-    lastTime = now
+/** 用户点「取消上传」：中止请求，状态由 catch 分支统一收尾 */
+function cancelUpload(): void {
+  if (!upload.active) return
+  uploadAbort?.abort()
+}
+
+function onUploadTick(seq: number) {
+  return (event: { loaded: number; total: number }): void => {
+    if (seq !== uploadSeq) return // 旧上传的回调：丢弃，别写坏新上传的进度
+    const now = performance.now()
+    const dt = (now - lastTime) / 1000
+    upload.loaded = event.loaded
+    if (event.total) upload.total = event.total
+    if (dt > 0.15) {
+      const delta = event.loaded - lastLoaded
+      upload.speedKBps = delta > 0 ? delta / 1024 / dt : upload.speedKBps * 0.9
+      lastLoaded = event.loaded
+      lastTime = now
+    }
+    upload.percent =
+      upload.total > 0 ? Math.min(99, Math.round((upload.loaded / upload.total) * 100)) : 0
+    upload.etaSec =
+      upload.speedKBps > 0.05 && upload.total > upload.loaded
+        ? (upload.total - upload.loaded) / 1024 / upload.speedKBps
+        : null
   }
-  upload.percent =
-    upload.total > 0 ? Math.min(99, Math.round((upload.loaded / upload.total) * 100)) : 0
-  upload.etaSec =
-    upload.speedKBps > 0.05 && upload.total > upload.loaded
-      ? (upload.total - upload.loaded) / 1024 / upload.speedKBps
-      : null
 }
 
 /**
@@ -1072,7 +1208,7 @@ function openPackDialog(): void {
 
 async function uploadAsset(options: UploadRequestOptions): Promise<void> {
   const file = options.file as File
-  startUpload(file.size)
+  const seq = startUpload(file.size)
   try {
     const result = await fashionApi.adminUploadAsset(
       {
@@ -1081,8 +1217,10 @@ async function uploadAsset(options: UploadRequestOptions): Promise<void> {
         version: assetForm.version.trim() || '1',
         cosmeticId: assetForm.cosmeticId,
       },
-      onUploadTick
+      onUploadTick(seq),
+      uploadAbort?.signal
     )
+    if (seq !== uploadSeq) return // 上传期间弹窗被关闭 / 发起了新上传：结果作废
     upload.percent = 100
     upload.active = false
     ElMessage.success(
@@ -1093,29 +1231,49 @@ async function uploadAsset(options: UploadRequestOptions): Promise<void> {
     assetDialog.visible = false
     await Promise.all([loadAssets(), loadCatalog()])
   } catch (error) {
+    if (seq !== uploadSeq) return
     upload.active = false
+    if (fashionErrorIsCanceled(error)) {
+      // 用户自己点的「取消上传」/关掉了弹窗：不是失败，不弹红条
+      resetUpload()
+      ElMessage.info('已取消上传')
+      return
+    }
     upload.error = adminErrorMessage(error, '上传失败')
-    ElMessage.error(upload.error)
+    // 401 已由拦截器统一提示（弹窗内仍保留一行说明），不再重复弹红条
+    if (!isSilentFashionError(error)) ElMessage.error(upload.error)
+  } finally {
+    if (seq === uploadSeq) uploadAbort = null
   }
 }
 
 async function uploadPack(options: UploadRequestOptions): Promise<void> {
   const file = options.file as File
-  startUpload(file.size)
+  const seq = startUpload(file.size)
   try {
     const result = await fashionApi.adminUploadPack(
       { file, packId: packForm.packId.trim(), version: packForm.version.trim() },
-      onUploadTick
+      onUploadTick(seq),
+      uploadAbort?.signal
     )
+    if (seq !== uploadSeq) return
     upload.percent = 100
     upload.active = false
     ElMessage.success(`已发布 ${result.pack.id} v${result.pack.version}（${fmtBytes(result.pack.bytes)}）`)
     packDialog.visible = false
     await loadPacks()
   } catch (error) {
+    if (seq !== uploadSeq) return
     upload.active = false
+    if (fashionErrorIsCanceled(error)) {
+      resetUpload()
+      ElMessage.info('已取消上传')
+      return
+    }
     upload.error = adminErrorMessage(error, '发布失败')
-    ElMessage.error(upload.error)
+    if (!isSilentFashionError(error)) ElMessage.error(upload.error)
+  } finally {
+    if (seq === uploadSeq) uploadAbort = null
   }
 }
 
@@ -1152,7 +1310,7 @@ async function removePack(pack: FashionPack): Promise<void> {
       ).catch(() => undefined)
       return
     }
-    ElMessage.error(adminErrorMessage(error, '下架失败'))
+    notifyAdminError(error, '下架失败')
   }
 }
 
@@ -1350,11 +1508,18 @@ onMounted(async () => {
 
 .upload-meta {
   display: flex;
+  align-items: center;
   gap: var(--space-2);
   flex-wrap: wrap;
   font-size: 11.5px;
   color: var(--text-secondary);
   margin-top: var(--space-1);
+}
+
+/* 「取消上传」：贴在进度信息行右侧，64MB 慢速上行时给用户一条退路 */
+.upload-cancel {
+  margin-left: auto;
+  padding: 0 4px;
 }
 
 .upload-error {
