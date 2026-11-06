@@ -43,6 +43,9 @@ from vmtools_next.data.models.fashion import (
     FashionCatalogModel,
     FashionIdentityModel,
     FashionLoadoutModel,
+    FashionMangoTransactionModel,
+    FashionOwnershipModel,
+    FashionWalletModel,
     FashionWardrobeModel,
 )
 from loguru import logger
@@ -56,6 +59,18 @@ SLOT_ORDER = {slot: idx for idx, slot in enumerate(SLOTS)}
 
 MIN_SCALE = 0.25
 MAX_SCALE = 4.0
+
+# ── 芒果块（v1.1 代币购买）常量 ──────────────────────────────────────────
+MANGO_CURRENCY_NAME = "芒果块"
+# 单件时装价格上限 / 管理端单次调整上限（防止误操作把余额搞到溢出）
+MAX_PRICE_MANGO = 1_000_000
+MAX_ADJUST_DELTA = 1_000_000
+MAX_CLIENT_REQUEST_ID_LEN = 64
+MAX_LIST_LIMIT = 100
+DEFAULT_LIST_LIMIT = 20
+# 购买接口限流（路由层用；这里只放常量，计数器在 router 里）
+PURCHASE_RATE_WINDOW = 60.0
+PURCHASE_RATE_LIMIT = 20
 
 # ── cosmeticId 契约（mod docs/fashion-api.md §3） ────────────────────────
 #
@@ -317,7 +332,53 @@ def _catalog_row_to_dict(row: Any) -> dict:
         "bytes": int(getattr(row, "bytes", 0) or 0),
         "enabled": bool(getattr(row, "enabled", True)),
         "sortOrder": int(getattr(row, "sort_order", 0) or 0),
+        # 芒果块定价（v1.1）。老库 / 离线 stub 里没有这两列时给安全默认值：
+        # 0 = 免费、True = 可购买 —— 与上线前行为完全一致，不会把历史数据锁住。
+        "priceMango": _price_of_row(row),
+        "purchasable": _purchasable_of_row(row),
     }
+
+
+def _normalize_price(value: Any) -> int:
+    """目录价格的统一归一化（审计 P2-8）。
+
+    管理端入口有 ``validate_price_mango`` 兜底，但绕过 ORM 的直改库 / 数据导入
+    可能塞进负数或超大值。旧实现「负数→0（免费）、超大值照单收」两头都不安全：
+    前者把付费商品变免费（资损），后者能扣出超额芒果块。统一为：
+
+    - 非法类型 / NULL / 负数 → 0（免费，最保守的兼容行为）
+    - 超过 ``MAX_PRICE_MANGO`` → 钳到上限并记 error（既不免费也不超收）
+    """
+    try:
+        price = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    if price <= 0:
+        return 0
+    if price > MAX_PRICE_MANGO:
+        logger.error(
+            "fashion mango: 目录价格 {} 超过上限 {}，已钳制", price, MAX_PRICE_MANGO
+        )
+        return MAX_PRICE_MANGO
+    return price
+
+
+def _price_of_row(row: Any) -> int:
+    """读目录行的价格，缺列 / NULL / 非法值一律当 0（免费）。"""
+    return _normalize_price(getattr(row, "price_mango", 0))
+
+
+def _purchasable_of_row(row: Any) -> bool:
+    """读目录行是否可购买，缺列 / NULL 一律当 True。"""
+    value = getattr(row, "purchasable", None)
+    return True if value is None else bool(value)
+
+
+def _price_of_meta(meta: Optional[dict]) -> int:
+    """取目录快照里的 ``priceMango``（与 ``_price_of_row`` 同一套钳制规则）。"""
+    if not meta:
+        return 0
+    return _normalize_price(meta.get("priceMango", 0))
 
 
 def list_catalog(
@@ -554,6 +615,9 @@ def upsert_catalog_item(db: Any, payload: dict) -> dict:
                 safe_join(Path("/tmp"), asset_key)
             except FashionServiceError as exc:
                 raise FashionServiceError("invalid_asset_key", exc.message) from exc
+    if "priceMango" in payload and payload.get("priceMango") is not None:
+        # 提前校验：别让非法价格走到写库那一步才炸（也保证错误码稳定）
+        validate_price_mango(payload.get("priceMango"))
 
     created = row is None
     if created:
@@ -569,6 +633,9 @@ def upsert_catalog_item(db: Any, payload: dict) -> dict:
         row.sort_order = 0
         row.sha256 = ""
         row.bytes = 0
+        # 显式落默认值（同上，commit 前就要返回完整对象）：不设价 = 免费
+        row.price_mango = 0
+        row.purchasable = True
     # 全局 ID 的前缀就是权威 packId（validate 已保证两者一致 / 已推导）
     row.pack_id = pack_id[:64]
     if "name" in payload:
@@ -585,6 +652,10 @@ def upsert_catalog_item(db: Any, payload: dict) -> dict:
         row.enabled = bool(payload.get("enabled"))
     if payload.get("sortOrder") is not None:
         row.sort_order = int(payload.get("sortOrder") or 0)
+    if "priceMango" in payload and payload.get("priceMango") is not None:
+        row.price_mango = validate_price_mango(payload.get("priceMango"))
+    if payload.get("purchasable") is not None:
+        row.purchasable = bool(payload.get("purchasable"))
     _commit_or_conflict(db, what="catalog")
     invalidate_caches()
     logger.info("fashion catalog {} cosmetic={}", "created" if created else "updated", cosmetic_id)
@@ -814,6 +885,7 @@ def put_loadout(
     items: Iterable[dict],
     *,
     settings: Any = None,
+    user_id: Optional[str] = None,
 ) -> tuple[datetime, list[dict]]:
     """全量覆盖写入穿戴配置（未出现的槽位 = 卸下）。
 
@@ -834,10 +906,18 @@ def put_loadout(
 
     Returns:
         ``(updated_at, warnings)``；``warnings`` 每项
-        ``{"slot", "cosmeticId", "code"}``（code: ``unknown_cosmetic`` / ``cosmetic_disabled``）。
+        ``{"slot", "cosmeticId", "code"}``（code: ``unknown_cosmetic`` /
+        ``cosmetic_disabled`` / ``not_owned``）。
 
     Raises:
         FashionServiceError: 请求体非法（槽位 / 条数 / scale）
+
+    ``user_id``（v1.1）
+    -------------------
+    网页登录态或已绑定账号的 mod token 会传 ``user_id``，用于拦截「没买就穿」：
+    付费且未拥有的条目 skip 并给 ``not_owned`` warning，不整条失败（老 mod 客户端
+    忽略未知 warning，不会被 4xx 打断同步）。``user_id`` 为空（未绑定身份的 mod
+    token）时**跳过该校验**，保持上线前行为 —— 这类客户端本来就没有网站钱包。
     """
     cfg = _settings(settings)
     max_items = int(getattr(cfg, "max_loadout_items", 8) or 8)
@@ -886,6 +966,13 @@ def put_loadout(
         if not bool(cosmetic.get("enabled", True)):
             warnings.append(
                 {"slot": slot, "cosmeticId": cosmetic_id, "code": "cosmetic_disabled"}
+            )
+            continue
+        # v1.1：付费时装必须先购买/拥有才能穿戴。只 skip 这一条，不整条失败。
+        # 「已在衣柜」也算已拥有：兼容没跑回填迁移的历史库（老收藏不追溯收费）。
+        if user_id and not _loadout_ownership_ok(db, str(user_id), canonical_id, cosmetic):
+            warnings.append(
+                {"slot": slot, "cosmeticId": cosmetic_id, "code": "not_owned"}
             )
             continue
         raw_scale = (raw or {}).get("scale") if isinstance(raw, dict) else None
@@ -1049,6 +1136,9 @@ def add_wardrobe_item(db: Any, user_id: str, cosmetic_id: Any) -> tuple[dict, bo
         raise FashionServiceError(
             "cosmetic_not_found", "时装不存在或已下架", status_code=404
         )
+    # v1.1 防绕过：付费且未拥有的时装不能从这里免费「加入衣柜」。
+    # 价格 0（默认）/ 已购买 / 历史已在衣柜 的都放行，上线前行为完全不变。
+    assert_wardrobe_allowed(db, str(user_id), cid, meta)
     stored_id = canonical_loadout_cosmetic_id(meta, cid) or cid
     # 幂等判定要认「同一件时装的任意历史形态」：上报值 / 规范值 / 目录原值
     # 都算同一件（旧版本按简单 ID 存过、新版按全局 ID 存的都会命中）。
@@ -2079,3 +2169,997 @@ def resolve_asset_file(
         etag = digest or f"{size}-{mtime}"
         return {"path": path, "sha256": digest, "bytes": size, "etag": f'"{etag}"'}
     return None
+
+
+# ── 芒果块钱包 / 代币购买（v1.1）─────────────────────────────────────────
+#
+# 设计要点（契约见 docs/fashion-mango-wallet-api.md）：
+#
+# - **货币**：芒果块，整数，余额恒非负。钱包一行/账号，流水只追加。
+# - **权利 vs 收藏**：``fashion_ownership`` 是「买没买」（永不因删衣柜消失），
+#   ``fashion_wardrobe`` 是「收藏夹里放不放」。买完必须同时写衣柜 —— mod 端
+#   ``GET /wardrobe/me`` 只读衣柜，不写就等于买了穿不上。
+# - **幂等**：ownership 的 (user_id, cosmetic_id) 唯一约束 + 可选 clientRequestId
+#   唯一键。重复购买不扣款、返回 200。
+# - **并发**：扣款用条件 UPDATE ``WHERE balance >= price``（数据库行锁内原子判定），
+#   不用「先读后写」—— 后者在两个并发请求下会把余额扣成负数。
+# - **兼容**：价格默认 0 = 免费；历史衣柜条目懒回填成 legacy_wardrobe 所有权，
+#   不追溯收费。所有新列的读取都走 getattr 默认值，老库 / 离线 stub 不会炸。
+
+
+def validate_price_mango(value: Any) -> int:
+    """校验并返回目录价格（0..MAX_PRICE_MANGO）。0 = 免费。"""
+    if isinstance(value, bool):
+        raise FashionServiceError("invalid_price", "价格必须是整数（芒果块）")
+    try:
+        price = int(value)
+    except (TypeError, ValueError):
+        raise FashionServiceError("invalid_price", "价格必须是整数（芒果块）") from None
+    if not 0 <= price <= MAX_PRICE_MANGO:
+        raise FashionServiceError(
+            "invalid_price", f"价格必须在 0 ~ {MAX_PRICE_MANGO} 芒果块之间"
+        )
+    return price
+
+
+def validate_adjust_delta(value: Any) -> int:
+    """校验管理端调整量：±1..MAX_ADJUST_DELTA，不能为 0。"""
+    if isinstance(value, bool):
+        raise FashionServiceError("invalid_amount", "调整数量必须是非零整数")
+    try:
+        delta = int(value)
+    except (TypeError, ValueError):
+        raise FashionServiceError("invalid_amount", "调整数量必须是非零整数") from None
+    if delta == 0:
+        raise FashionServiceError("invalid_amount", "调整数量不能为 0")
+    if abs(delta) > MAX_ADJUST_DELTA:
+        raise FashionServiceError(
+            "invalid_amount", f"单次最多调整 {MAX_ADJUST_DELTA} 芒果块"
+        )
+    return delta
+
+
+def validate_client_request_id(value: Any) -> Optional[str]:
+    """购买幂等键：空 = 不带；非空必须是 <=64 的安全字符。"""
+    if value is None:
+        return None
+    key = str(value).strip()
+    if not key:
+        return None
+    if len(key) > MAX_CLIENT_REQUEST_ID_LEN or not re.match(
+        r"^[A-Za-z0-9._:-]+$", key
+    ):
+        raise FashionServiceError(
+            "invalid_client_request_id",
+            f"clientRequestId 只允许字母/数字/._:-，长度 ≤{MAX_CLIENT_REQUEST_ID_LEN}",
+        )
+    return key
+
+
+def _normalize_pagination(limit: Any, offset: Any) -> tuple[int, int]:
+    """分页参数收敛：limit 1..100，offset >= 0，非法值给默认值而不是 500。"""
+    try:
+        lim = int(limit if limit is not None else DEFAULT_LIST_LIMIT)
+    except (TypeError, ValueError):
+        lim = DEFAULT_LIST_LIMIT
+    try:
+        off = int(offset if offset is not None else 0)
+    except (TypeError, ValueError):
+        off = 0
+    return max(1, min(MAX_LIST_LIMIT, lim)), max(0, off)
+
+
+def _wallet_row(db: Any, user_id: str) -> Any:
+    return (
+        db.query(FashionWalletModel)
+        .filter_by(user_id=str(user_id))
+        .first()
+    )
+
+
+def get_or_create_wallet(db: Any, user_id: str) -> Any:
+    """取钱包，没有就创建（余额 0）。
+
+    会 ``commit``：调用方必须在**事务干净时**调它（购买流程把它放在所有写操作
+    之前）。并发首次访问撞主键时回滚后重查，不把 IntegrityError 漏成 500。
+    """
+    row = _wallet_row(db, user_id)
+    if row is not None:
+        return row
+    row = FashionWalletModel(
+        user_id=str(user_id),
+        balance=0,
+        total_earned=0,
+        total_spent=0,
+        updated_at=utcnow(),
+    )
+    db.add(row)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        row = _wallet_row(db, user_id)
+        if row is None:  # pragma: no cover - 约束冲突却查不到行
+            raise FashionServiceError(
+                "conflict", "钱包初始化冲突，请重试", status_code=409
+            )
+    return row
+
+
+def wallet_to_dict(row: Any) -> dict:
+    """钱包形状（camelCase，与 schemas.WalletOut 一一对应）。"""
+    return {
+        "balance": int(getattr(row, "balance", 0) or 0),
+        "currency": MANGO_CURRENCY_NAME,
+        "totalEarned": int(getattr(row, "total_earned", 0) or 0),
+        "totalSpent": int(getattr(row, "total_spent", 0) or 0),
+        "updatedAt": iso(getattr(row, "updated_at", None)),
+    }
+
+
+def get_wallet(db: Any, user_id: str) -> dict:
+    """``GET /wallet``：首次访问自动建钱包。"""
+    return wallet_to_dict(get_or_create_wallet(db, str(user_id)))
+
+
+def _expire_session(db: Any) -> None:
+    """让条件 UPDATE 之后重新查到真实余额（identity map 里可能是旧对象）。"""
+    expire_all = getattr(db, "expire_all", None)
+    if callable(expire_all):
+        expire_all()
+
+
+def _append_transaction(
+    db: Any,
+    *,
+    user_id: str,
+    delta: int,
+    balance_after: int,
+    tx_type: str,
+    cosmetic_id: str = "",
+    cosmetic_name: str = "",
+    note: str = "",
+    idempotency_key: Optional[str] = None,
+    operator_user_id: Optional[str] = None,
+) -> Any:
+    """追加一条流水（**不 commit**，由调用方在同一个事务里统一提交）。"""
+    row = FashionMangoTransactionModel(
+        id=str(uuid_lib.uuid4()),
+        user_id=str(user_id),
+        delta=int(delta),
+        balance_after=int(balance_after),
+        tx_type=str(tx_type),
+        cosmetic_id=str(cosmetic_id or "")[:256],
+        cosmetic_name=str(cosmetic_name or "")[:128],
+        note=str(note or "")[:256],
+        idempotency_key=idempotency_key or None,
+        operator_user_id=str(operator_user_id) if operator_user_id else None,
+        created_at=utcnow(),
+    )
+    db.add(row)
+    return row
+
+
+def _transaction_item_dict(row: Any) -> dict:
+    delta = int(getattr(row, "delta", 0) or 0)
+    return {
+        "id": str(getattr(row, "id", "") or ""),
+        "type": str(getattr(row, "tx_type", "") or "purchase"),
+        "delta": delta,
+        "balanceAfter": int(getattr(row, "balance_after", 0) or 0),
+        "amountAbs": abs(delta),
+        "cosmeticId": str(getattr(row, "cosmetic_id", "") or ""),
+        "cosmeticName": str(getattr(row, "cosmetic_name", "") or ""),
+        "note": str(getattr(row, "note", "") or ""),
+        "createdAt": iso(getattr(row, "created_at", None)),
+    }
+
+
+def list_transactions(
+    db: Any, user_id: str, *, limit: Any = None, offset: Any = None
+) -> dict:
+    """收支明细（按时间倒序，分页）。"""
+    lim, off = _normalize_pagination(limit, offset)
+    rows = (
+        db.query(FashionMangoTransactionModel)
+        .filter_by(user_id=str(user_id))
+        .all()
+        or []
+    )
+    # SQLite 读回的 datetime 是 naive，直接比较会 TypeError → 走 _dt_sort_key
+    rows.sort(
+        key=lambda r: (
+            _dt_sort_key(getattr(r, "created_at", None)),
+            str(getattr(r, "id", "")),
+        ),
+        reverse=True,
+    )
+    total = len(rows)
+    return {
+        "items": [_transaction_item_dict(r) for r in rows[off : off + lim]],
+        "total": total,
+        "limit": lim,
+        "offset": off,
+    }
+
+
+def _ownership_rows(db: Any, user_id: str) -> list[Any]:
+    return (
+        db.query(FashionOwnershipModel)
+        .filter_by(user_id=str(user_id))
+        .all()
+        or []
+    )
+
+
+def _catalog_key_map(db: Any) -> dict[str, dict]:
+    """含别名的目录快照（精确 ID 优先），用于把任意形态的 cosmeticId 归一化。"""
+    return _catalog_map(db, enabled_only=False)
+
+
+def _owner_key(cid: Any, catalog: dict[str, dict]) -> str:
+    """把任意形态的 cosmeticId 归一化成「所有权 / 衣柜」的**单一匹配键**。
+
+    ⚠️ **安全（审计 P0）**：绝不能用「裸 localId 别名集合求交集」判断拥有。
+    目录里可能同时存在简单 ID 条目 ``crown``（便宜）与多个全局 ID 条目
+    ``packX:crown``（贵）：若把 ``crown`` 也塞进 ``packX:crown`` 的候选集，
+    买下便宜的 ``crown`` 后所有 ``packX:crown`` 都会被判成已拥有 —— 直接绕过计费。
+
+    正确做法是把**两边都映射到同一个规范键再精确比较**：
+
+    - ``packX:crown`` → ``packX:crown``
+    - ``crown``（当它只是 ``packX:crown`` 的别名）→ ``packX:crown``
+    - ``crown``（当它本身就是目录里的简单 ID 条目）→ ``crown``
+    - 目录条目已被删除 → 退化为原值（残留记录仍能被匹配 / 删除）
+
+    ``catalog`` 必须是 :func:`_catalog_map` 的快照（含别名），精确 ID 永远优先，
+    所以「简单 ID 条目存在时不会被同名全局条目的别名覆盖」。
+    """
+    value = str(cid or "").strip()
+    if not value:
+        return ""
+    meta = catalog.get(value)
+    if meta is None:
+        return value
+    return canonical_loadout_cosmetic_id(meta, value) or value
+
+
+def _row_key_set(rows: Iterable[Any], catalog: dict[str, dict]) -> set[str]:
+    keys = {_owner_key(getattr(r, "cosmetic_id", ""), catalog) for r in rows}
+    keys.discard("")
+    return keys
+
+
+def _owned_key_set(db: Any, user_id: str, catalog: dict[str, dict]) -> set[str]:
+    return _row_key_set(_ownership_rows(db, user_id), catalog)
+
+
+def _wardrobe_key_set(db: Any, user_id: str, catalog: dict[str, dict]) -> set[str]:
+    return _row_key_set(_wardrobe_rows(db, user_id), catalog)
+
+
+def _is_owned(
+    db: Any, user_id: str, owner_key: str, catalog: dict[str, dict]
+) -> bool:
+    return bool(owner_key) and owner_key in _owned_key_set(db, user_id, catalog)
+
+
+def _in_wardrobe(
+    db: Any, user_id: str, owner_key: str, catalog: dict[str, dict]
+) -> bool:
+    return bool(owner_key) and owner_key in _wardrobe_key_set(db, user_id, catalog)
+
+
+def _scoped_idempotency_key(user_id: str, key: Optional[str]) -> Optional[str]:
+    """给幂等键加用户前缀。
+
+    ``fashion_mango_transaction.idempotency_key`` 是**全局**唯一索引，而预查按
+    ``user_id`` 过滤。不加前缀时 A 用户用了 key K，B 用户再用 K 会在 commit 时撞
+    全局唯一约束 → 409，且因为 A 的记录一直占着，B 重试永远失败（审计 P1）。
+    加前缀后唯一性变成「用户内唯一」，契约里的 ``clientRequestId`` 形状不变。
+    """
+    if not key:
+        return None
+    return f"{user_id}:{key}"
+
+
+def ensure_legacy_ownership(db: Any, user_id: str) -> int:
+    """把「历史衣柜收藏」回填成所有权（幂等，价格 0）。
+
+    为什么必须有这一步：v1.1 上线后管理端才给某件时装设价，而玩家**上线前**就
+    免费把它加进衣柜了。不回填的话这些玩家会被判「未拥有」→ 不能重新加入衣柜、
+    甚至穿戴被 skip，等于追溯收费。回填后所有权与衣柜解耦，删收藏也不丢权利。
+
+    Alembic 迁移里也做了一次 SQL 回填；这里是**兜底**：开发机直接跑 ``create_all``
+    （不跑 alembic）或迁移漏跑时，第一次打开商店页就会自动补齐。
+
+    会 commit（只在确有新增行时），调用方需保证此时事务干净。
+    """
+    catalog = _catalog_key_map(db)
+    owned = _owned_key_set(db, str(user_id), catalog)
+    # 存规范化 key：同一件时装的历史「简单 ID」与「全局 ID」两行衣柜会合并成
+    # 一条所有权，既幂等又避免后续被误判成两件。
+    pending: list[str] = []
+    for row in _wardrobe_rows(db, str(user_id)):
+        owner_key = _owner_key(getattr(row, "cosmetic_id", ""), catalog)
+        if owner_key and owner_key not in owned:
+            owned.add(owner_key)
+            pending.append(owner_key)
+    if not pending:
+        return 0
+    now = utcnow()
+    for owner_key in pending:
+        db.add(
+            FashionOwnershipModel(
+                id=str(uuid_lib.uuid4()),
+                user_id=str(user_id),
+                cosmetic_id=owner_key[:256],
+                price_paid=0,
+                source="legacy_wardrobe",
+                order_no="",
+                note="上线前已收藏，自动继承所有权",
+                acquired_at=now,
+            )
+        )
+    try:
+        db.commit()
+    except IntegrityError:
+        # 并发回填：另一请求已插入，回滚即可，所有权已存在
+        db.rollback()
+        return 0
+    logger.info(
+        "fashion mango: backfilled {} legacy wardrobe rows for user={}",
+        len(pending), user_id,
+    )
+    return len(pending)
+
+
+def assert_wardrobe_allowed(db: Any, user_id: str, cid: str, meta: dict) -> None:
+    """``POST /wardrobe`` 的付费门槛（v1.1 防绕过）。
+
+    价格 0 / 已拥有 / 历史已在衣柜 → 放行（与上线前行为一致）；
+    付费且未拥有 → 403 ``purchase_required``，必须走 ``POST /store/purchase``。
+    """
+    price = _price_of_meta(meta)
+    if price <= 0:
+        return
+    catalog = _catalog_key_map(db)
+    owner_key = _owner_key(cid, catalog)
+    if _is_owned(db, str(user_id), owner_key, catalog):
+        return
+    # 老库没跑回填时，衣柜里的历史行必须视为已拥有（不能锁住老玩家）
+    if _in_wardrobe(db, str(user_id), owner_key, catalog):
+        return
+    hint = ""
+    if not bool(meta.get("purchasable", True)):
+        hint = "；这件时装暂不可购买，请联系管理员发放"
+    raise FashionServiceError(
+        "purchase_required",
+        f"这件时装需要 {price} 芒果块购买后才能加入衣柜{hint}",
+        status_code=403,
+    )
+
+
+def _loadout_ownership_ok(
+    db: Any, user_id: str, canonical_id: str, meta: dict
+) -> bool:
+    """``PUT /loadout`` 的付费校验：免费 / 已拥有 / 已在衣柜 → 允许穿戴。"""
+    if _price_of_meta(meta) <= 0:
+        return True
+    catalog = _catalog_key_map(db)
+    owner_key = _owner_key(canonical_id, catalog)
+    return _is_owned(db, str(user_id), owner_key, catalog) or _in_wardrobe(
+        db, str(user_id), owner_key, catalog
+    )
+
+
+def _store_item_dict(meta: dict, *, owned: bool, in_wardrobe: bool) -> dict:
+    """商店条目形状（schemas.StoreItem）。"""
+    return {
+        "cosmeticId": str(meta.get("cosmeticId") or ""),
+        "name": str(meta.get("name") or ""),
+        "category": str(meta.get("category") or "other"),
+        "assetKey": str(meta.get("assetKey") or ""),
+        "sha256": str(meta.get("sha256") or ""),
+        "bytes": int(meta.get("bytes") or 0),
+        "packId": str(meta.get("packId") or ""),
+        "sortOrder": int(meta.get("sortOrder") or 0),
+        "priceMango": _price_of_meta(meta),
+        "purchasable": bool(meta.get("purchasable", True)),
+        "owned": bool(owned),
+        "inWardrobe": bool(in_wardrobe),
+    }
+
+
+def store_items(
+    db: Any,
+    user_id: str,
+    *,
+    category: Optional[str] = None,
+    pack_id: Optional[str] = None,
+    settings: Any = None,
+) -> dict:
+    """商店页聚合数据：目录 + 定价 + 拥有/衣柜状态 + 钱包（一次请求拿全）。
+
+    不复用 ``GET /catalog`` 的缓存结果做用户态加工 —— 那个缓存是**全站共享**的，
+    把 owned/inWardrobe 混进去会串号。这里只复用 ``list_catalog`` 的目录快照。
+    """
+    uid = str(user_id)
+    ensure_legacy_ownership(db, uid)
+    wallet = get_or_create_wallet(db, uid)
+    items = list_catalog(
+        db, enabled_only=True, category=category, pack_id=pack_id, settings=settings
+    )
+    catalog = _catalog_key_map(db)
+    owned = _owned_key_set(db, uid, catalog)
+    wardrobe = _wardrobe_key_set(db, uid, catalog)
+    result: list[dict] = []
+    for meta in items:
+        # 规范键精确匹配：绝不能用别名集合求交，否则「便宜简单 ID」会把
+        # 所有同名 localId 的昂贵全局 ID 标成已拥有（审计 P0）。
+        owner_key = _owner_key(meta.get("cosmeticId"), catalog)
+        result.append(
+            _store_item_dict(
+                meta,
+                owned=owner_key in owned,
+                in_wardrobe=owner_key in wardrobe,
+            )
+        )
+    result.sort(key=lambda it: (it["sortOrder"], it["cosmeticId"]))
+    return {
+        "currency": MANGO_CURRENCY_NAME,
+        "wallet": wallet_to_dict(wallet),
+        "rechargeAvailable": False,
+        "items": result,
+    }
+
+
+def _ensure_wardrobe_row(
+    db: Any,
+    user_id: str,
+    owner_key: str,
+    catalog: dict[str, dict],
+) -> None:
+    """购买/发放后确保该时装在衣柜里（**不 commit**，由调用方统一提交）。
+
+    ``owner_key`` 是规范化后的 ID，落库也用它 —— 保证 ``fashion_wardrobe``、
+    ``fashion_ownership`` 与 ``GET /wardrobe/me`` 三处看到的是同一个形态。
+    """
+    if _in_wardrobe(db, str(user_id), owner_key, catalog):
+        return
+    db.add(
+        FashionWardrobeModel(
+            id=str(uuid_lib.uuid4()),
+            user_id=str(user_id),
+            cosmetic_id=owner_key[:256],
+            added_at=utcnow(),
+        )
+    )
+
+
+def _purchase_already_owned(
+    db: Any,
+    user_id: str,
+    canonical_id: str,
+    meta: dict,
+    owner_key: str,
+    catalog: dict[str, dict],
+    *,
+    prior: Any = None,
+) -> dict:
+    """幂等返回（重复购买 / 并发被抢先 / 命中已有幂等键）。
+
+    不扣款，但会补一次衣柜 —— 玩家可能把买过的时装从收藏夹删掉了，再点一次
+    「购买」应该免费把它加回来（权利还在 ownership 里）。
+
+    ``prior`` 是命中 ``clientRequestId`` 时查到的**首次交易流水**：价格、是否免费、
+    当时的余额与流水号都从它恢复，而不是重新按「当前目录价格 / 当前余额」拼一份
+    自相矛盾的响应（审计 P2-2）。普通重复购买没有 prior，就用当前目录价格，
+    但 ``free`` 必须与 ``priceMango`` 保持一致（price=0 → free=true）。
+    """
+    _ensure_wardrobe_row(db, user_id, owner_key, catalog)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()  # 并发插入撞唯一约束：衣柜里已经有，忽略即可
+    wallet = get_or_create_wallet(db, user_id)
+    price = _price_of_meta(meta)
+    if prior is not None:
+        delta = int(getattr(prior, "delta", 0) or 0)
+        price = abs(delta)
+        return {
+            "ok": True,
+            "purchased": False,
+            "alreadyOwned": True,
+            "free": delta == 0,
+            "priceMango": price,
+            "balance": int(getattr(prior, "balance_after", 0) or 0),
+            "cosmeticId": canonical_id,
+            "item": _store_item_dict(meta, owned=True, in_wardrobe=True),
+            "transactionId": str(getattr(prior, "id", "") or "") if delta < 0 else "",
+        }
+    return {
+        "ok": True,
+        "purchased": False,
+        "alreadyOwned": True,
+        "free": price == 0,
+        "priceMango": price,
+        "balance": int(getattr(wallet, "balance", 0) or 0),
+        "cosmeticId": canonical_id,
+        "item": _store_item_dict(meta, owned=True, in_wardrobe=True),
+        "transactionId": "",
+    }
+
+
+def purchase(
+    db: Any,
+    user_id: str,
+    cosmetic_id: Any,
+    *,
+    client_request_id: Any = None,
+) -> dict:
+    """用芒果块购买一件时装（或免费领取价格 0 的时装）。
+
+    事务边界：所有写操作（条件扣款 → ownership → 流水 → 衣柜）在**同一个
+    commit** 里完成；任何一步失败都整体回滚，不会出现「扣了钱没给时装」。
+    """
+    uid = str(user_id)
+    cid, _ = validate_cosmetic_id(cosmetic_id)
+    key = validate_client_request_id(client_request_id)
+    stored_key = _scoped_idempotency_key(uid, key)
+
+    # 1) 前置（可能各自 commit，此时事务必须干净）
+    ensure_legacy_ownership(db, uid)
+    if stored_key:
+        prior = (
+            db.query(FashionMangoTransactionModel)
+            .filter_by(user_id=uid, idempotency_key=stored_key)
+            .first()
+        )
+        if prior is not None:
+            prior_cid = str(getattr(prior, "cosmetic_id", "") or "")
+            catalog_for_key = _catalog_key_map(db)
+            # 冲突判定用「规范化键精确比较」而不是别名集合：
+            # 「先买简单 ID、再买同一件的全局 ID」是同一件（幂等），
+            # 「先买 A、再买 B」才冲突。裸 localId 求交会跨包误判（审计 P0）。
+            key_prior = _owner_key(prior_cid, catalog_for_key)
+            key_req = _owner_key(cid, catalog_for_key)
+            if key_prior != key_req:
+                raise FashionServiceError(
+                    "idempotency_key_conflict",
+                    "该请求编号已用于购买另一件时装",
+                    status_code=409,
+                )
+            meta_for_key = catalog_for_key.get(prior_cid) or _lookup_catalog_item(
+                db, prior_cid or cid, catalog_for_key
+            )
+            # 目录条目后来被管理端删了也要幂等返回（不能让重复提交变成 404）：
+            # 用流水里残留的 id/name 拼一个最小 meta。
+            if meta_for_key is None:
+                meta_for_key = {
+                    "cosmeticId": prior_cid or cid,
+                    "name": str(getattr(prior, "cosmetic_name", "") or ""),
+                    "category": "other",
+                    "assetKey": "", "sha256": "", "bytes": 0,
+                    "packId": "", "sortOrder": 0,
+                    "priceMango": 0, "purchasable": True,
+                }
+            canon_for_key = _owner_key(prior_cid or cid, catalog_for_key)
+            return _purchase_already_owned(
+                db, uid, canon_for_key, meta_for_key, key_prior,
+                catalog_for_key, prior=prior,
+            )
+    wallet = get_or_create_wallet(db, uid)
+
+    # 2) 目录校验
+    catalog = _catalog_key_map(db)
+    meta = _lookup_catalog_item(db, cid, catalog)
+    if meta is None or not bool(meta.get("enabled", True)):
+        raise FashionServiceError(
+            "cosmetic_not_found", "时装不存在或已下架", status_code=404
+        )
+    canonical_id = canonical_loadout_cosmetic_id(meta, cid) or cid
+    owner_key = _owner_key(canonical_id, catalog)
+    price = _price_of_meta(meta)
+    name = str(meta.get("name") or "")
+
+    # 3) 已拥有 → 幂等，不扣款。
+    # 必须排在 ``not_purchasable`` **之前**：管理端后来把某件时装改成「不可售卖」
+    # 时，此前已购买 / 已发放的用户仍要能幂等补回衣柜（审计 P2-3）。
+    if _is_owned(db, uid, owner_key, catalog):
+        return _purchase_already_owned(
+            db, uid, canonical_id, meta, owner_key, catalog
+        )
+    if not bool(meta.get("purchasable", True)):
+        raise FashionServiceError(
+            "not_purchasable", "这件时装暂不可购买，请联系管理员发放", status_code=409
+        )
+
+    now = utcnow()
+    balance_before = int(getattr(wallet, "balance", 0) or 0)
+    tx_row = None
+
+    # 4) 付费：条件 UPDATE 原子扣款（防并发超扣）；免费：不扣款但记一条 0 流水
+    if price > 0:
+        query = (
+            db.query(FashionWalletModel)
+            .filter_by(user_id=uid)
+            .filter(FashionWalletModel.balance >= price)
+        )
+        update_values = {
+            FashionWalletModel.balance: FashionWalletModel.balance - price,
+            FashionWalletModel.total_spent: FashionWalletModel.total_spent + price,
+            FashionWalletModel.updated_at: now,
+        }
+        update_fn = getattr(query, "update", None)
+        if callable(update_fn):
+            updated = update_fn(update_values, synchronize_session=False)
+        else:  # 离线 stub / 极简 Session：退化为读改写（仅供单测）
+            updated = 1 if balance_before >= price else 0
+            if updated:
+                wallet.balance = balance_before - price
+                wallet.total_spent = int(getattr(wallet, "total_spent", 0) or 0) + price
+                wallet.updated_at = now
+        if not updated:
+            db.rollback()
+            # 并发购买**同一件**时，另一请求可能刚刚扣完余额并提交了所有权；
+            # 这时应当幂等返回 200（已拥有），而不是误报「余额不足」。
+            # SQLite / PG 下条件 UPDATE 都会等对方释放写锁后才返回 0，
+            # 所以此刻对方的 ownership 已经可见。
+            if _is_owned(db, uid, owner_key, catalog):
+                return _purchase_already_owned(
+                    db, uid, canonical_id, meta, owner_key, catalog
+                )
+            # 并发下 ``balance_before`` 是本请求开始时读到的旧值，另一个请求可能
+            # 已经扣过款；必须重读一次，否则会算出「还差 0 芒果块」（审计 P2-7）。
+            fresh_now = _wallet_row(db, uid)
+            current = (
+                int(getattr(fresh_now, "balance", 0) or 0)
+                if fresh_now is not None else balance_before
+            )
+            short = max(0, price - current)
+            raise FashionServiceError(
+                "insufficient_mango",
+                f"芒果块不足，还差 {short} 芒果块，请先充值或联系管理员发放",
+                status_code=402,
+            )
+        _expire_session(db)
+        fresh = _wallet_row(db, uid)
+        balance_after = int(getattr(fresh, "balance", 0) or 0) if fresh is not None else balance_before - price
+        tx_type = "purchase"
+        source = "purchase"
+        note = f"购买时装「{name or canonical_id}」"
+    else:
+        balance_after = balance_before
+        tx_type = "grant"
+        source = "free_claim"
+        note = f"免费领取时装「{name or canonical_id}」"
+
+    # 5) 写所有权 + 流水 + 衣柜（同一事务）
+    order_no = str(uuid_lib.uuid4())
+    db.add(
+        FashionOwnershipModel(
+            id=str(uuid_lib.uuid4()),
+            user_id=uid,
+            # 存规范化键：与 wardrobe / 拥有判定使用同一个形态
+            cosmetic_id=owner_key[:256],
+            price_paid=price,
+            source=source,
+            order_no=order_no,
+            note=note,
+            acquired_at=now,
+        )
+    )
+    tx_row = _append_transaction(
+        db,
+        user_id=uid,
+        delta=-price if price > 0 else 0,
+        balance_after=balance_after,
+        tx_type=tx_type,
+        cosmetic_id=owner_key,
+        cosmetic_name=name,
+        note=note,
+        # 带用户前缀：全局唯一索引不能让 A 用户占用的 key 把 B 用户永久卡死
+        idempotency_key=stored_key,
+    )
+    _ensure_wardrobe_row(db, uid, owner_key, catalog)
+
+    try:
+        db.commit()
+    except IntegrityError as exc:
+        # 并发：另一请求先买了 / 先用了同一个幂等键。整体回滚（扣款也回滚），
+        # 再按「已拥有」幂等返回 —— 用户看到成功而不是一个莫名其妙的 409。
+        db.rollback()
+        logger.info("fashion mango: purchase conflict (idempotent retry) user={} cid={}", uid, canonical_id)
+        if _is_owned(db, uid, owner_key, catalog):
+            return _purchase_already_owned(
+                db, uid, canonical_id, meta, owner_key, catalog
+            )
+        raise FashionServiceError(
+            "conflict", "数据已被其他请求修改，请重试", status_code=409
+        ) from exc
+
+    logger.info(
+        "fashion mango: {} user={} cid={} price={} balance={}",
+        "purchased" if price > 0 else "free_claim",
+        uid, canonical_id, price, balance_after,
+    )
+    return {
+        "ok": True,
+        "purchased": True,
+        "alreadyOwned": False,
+        "free": price == 0,
+        "priceMango": price,
+        "balance": balance_after,
+        "cosmeticId": canonical_id,
+        "item": _store_item_dict(meta, owned=True, in_wardrobe=True),
+        "transactionId": str(getattr(tx_row, "id", "") or "") if price > 0 else "",
+    }
+
+
+def list_orders(
+    db: Any, user_id: str, *, limit: Any = None, offset: Any = None
+) -> dict:
+    """购买记录（所有权维度，按获得时间倒序；删衣柜不会消失）。"""
+    uid = str(user_id)
+    ensure_legacy_ownership(db, uid)
+    lim, off = _normalize_pagination(limit, offset)
+    rows = _ownership_rows(db, uid)
+    rows.sort(
+        key=lambda r: (
+            _dt_sort_key(getattr(r, "acquired_at", None)),
+            str(getattr(r, "id", "")),
+        ),
+        reverse=True,
+    )
+    total = len(rows)
+    catalog = _catalog_map(db, enabled_only=False)
+    items: list[dict] = []
+    for row in rows[off : off + lim]:
+        cid = str(getattr(row, "cosmetic_id", "") or "")
+        meta = catalog.get(cid)
+        items.append(
+            {
+                "orderNo": str(getattr(row, "order_no", "") or ""),
+                "cosmeticId": cid,
+                "name": str((meta or {}).get("name") or ""),
+                "category": str((meta or {}).get("category") or "other"),
+                "packId": str((meta or {}).get("packId") or ""),
+                "pricePaid": int(getattr(row, "price_paid", 0) or 0),
+                "source": str(getattr(row, "source", "") or "purchase"),
+                "note": str(getattr(row, "note", "") or ""),
+                "acquiredAt": iso(getattr(row, "acquired_at", None)),
+                "missing": meta is None or not bool((meta or {}).get("enabled", True)),
+            }
+        )
+    return {"items": items, "total": total, "limit": lim, "offset": off}
+
+
+def _find_user(db: Any, user_id: str) -> Any:
+    """查网站账号（管理端发放/查询用）。函数内 import 避免与鉴权模块循环。"""
+    from vmtools_next.data.models.auth import UserModel
+
+    return db.query(UserModel).filter_by(id=str(user_id)).first()
+
+
+def admin_adjust_wallet(
+    db: Any,
+    user_id: Any,
+    delta: Any,
+    *,
+    operator_user_id: Optional[str] = None,
+    note: str = "",
+) -> dict:
+    """管理端发放 / 扣回芒果块（充值通道开放前唯一的入金途径）。
+
+    ``delta > 0`` 发放，``delta < 0`` 扣回且**不允许把余额扣成负数**
+    （条件 UPDATE ``WHERE balance >= -delta``，防并发穿透）。
+    """
+    uid = str(user_id or "").strip()
+    if not uid:
+        raise FashionServiceError("user_not_found", "用户不存在", status_code=404)
+    amount = validate_adjust_delta(delta)
+    if _find_user(db, uid) is None:
+        raise FashionServiceError("user_not_found", "用户不存在", status_code=404)
+
+    get_or_create_wallet(db, uid)
+    now = utcnow()
+    query = db.query(FashionWalletModel).filter_by(user_id=uid)
+    if amount < 0:
+        # 扣回：余额必须够扣。放在 WHERE 里由数据库原子判定。
+        query = query.filter(FashionWalletModel.balance >= -amount)
+    values = {
+        FashionWalletModel.balance: FashionWalletModel.balance + amount,
+        FashionWalletModel.updated_at: now,
+    }
+    if amount > 0:
+        values[FashionWalletModel.total_earned] = (
+            FashionWalletModel.total_earned + amount
+        )
+    else:
+        values[FashionWalletModel.total_spent] = (
+            FashionWalletModel.total_spent + (-amount)
+        )
+    update_fn = getattr(query, "update", None)
+    if callable(update_fn):
+        updated = update_fn(values, synchronize_session=False)
+    else:  # 离线 stub 降级
+        row = _wallet_row(db, uid)
+        current = int(getattr(row, "balance", 0) or 0)
+        updated = 1 if amount > 0 or current >= -amount else 0
+        if updated:
+            row.balance = current + amount
+            row.updated_at = now
+            if amount > 0:
+                row.total_earned = int(getattr(row, "total_earned", 0) or 0) + amount
+            else:
+                row.total_spent = int(getattr(row, "total_spent", 0) or 0) + (-amount)
+    if not updated:
+        db.rollback()
+        raise FashionServiceError(
+            "insufficient_mango", "该用户余额不足，无法扣回这么多芒果块"
+        )
+    _expire_session(db)
+    fresh = _wallet_row(db, uid)
+    balance_after = int(getattr(fresh, "balance", 0) or 0) if fresh is not None else 0
+    tx_row = _append_transaction(
+        db,
+        user_id=uid,
+        delta=amount,
+        balance_after=balance_after,
+        tx_type="admin_adjust",
+        note=str(note or ("管理员发放" if amount > 0 else "管理员扣回"))[:256],
+        operator_user_id=operator_user_id,
+    )
+    _commit_or_conflict(db, what="admin_wallet_adjust")
+    logger.info(
+        "fashion mango: admin adjust user={} delta={} balance={} operator={}",
+        uid, amount, balance_after, operator_user_id,
+    )
+    return {
+        "ok": True,
+        "userId": uid,
+        "balance": balance_after,
+        "delta": amount,
+        "transactionId": str(getattr(tx_row, "id", "") or ""),
+    }
+
+
+def admin_wallet_users(
+    db: Any, *, keyword: str = "", limit: Any = None, offset: Any = None
+) -> dict:
+    """管理端用户钱包列表（按 gameId / displayName 模糊搜索）。
+
+    用 Python 层过滤而不是 SQL LIKE：用户表规模是「站点注册量」级别（远小于
+    资产表），且这样对离线 stub / 不同方言都一致，不引入 or_/ilike 兼容分支。
+    """
+    from vmtools_next.data.models.auth import UserModel
+
+    lim, off = _normalize_pagination(limit, offset)
+    needle = str(keyword or "").strip().lower()
+    users = db.query(UserModel).all() or []
+    wallets = {
+        str(getattr(r, "user_id", "") or ""): r
+        for r in (db.query(FashionWalletModel).all() or [])
+    }
+    matched: list[Any] = []
+    for user in users:
+        uid = str(getattr(user, "id", "") or "")
+        if not uid:
+            continue
+        if needle and needle not in str(getattr(user, "game_id", "") or "").lower() \
+                and needle not in str(getattr(user, "display_name", "") or "").lower():
+            continue
+        matched.append(user)
+    matched.sort(key=lambda u: str(getattr(u, "game_id", "") or "").lower())
+    total = len(matched)
+    items: list[dict] = []
+    for user in matched[off : off + lim]:
+        uid = str(getattr(user, "id", "") or "")
+        wallet = wallets.get(uid)
+        items.append(
+            {
+                "userId": uid,
+                "gameId": str(getattr(user, "game_id", "") or ""),
+                "displayName": str(getattr(user, "display_name", "") or ""),
+                "role": str(getattr(user, "role", "") or ""),
+                "balance": int(getattr(wallet, "balance", 0) or 0),
+                "totalEarned": int(getattr(wallet, "total_earned", 0) or 0),
+                "totalSpent": int(getattr(wallet, "total_spent", 0) or 0),
+            }
+        )
+    return {"items": items, "total": total, "limit": lim, "offset": off}
+
+
+def admin_grant_cosmetic(
+    db: Any,
+    user_id: Any,
+    cosmetic_id: Any,
+    *,
+    operator_user_id: Optional[str] = None,
+    note: str = "",
+) -> dict:
+    """管理端直接发放一件时装（不扣币）：补发 / 活动赠送 / 联调。
+
+    与购买共享 ownership + wardrobe 写入链路，所以发放后立刻能在衣柜和 mod 里用。
+    允许发放 ``enabled=false`` 的已下架条目（补发历史购买），但目录条目必须存在。
+    """
+    uid = str(user_id or "").strip()
+    if not uid or _find_user(db, uid) is None:
+        raise FashionServiceError("user_not_found", "用户不存在", status_code=404)
+    cid, _ = validate_cosmetic_id(cosmetic_id)
+    catalog = _catalog_key_map(db)
+    meta = _lookup_catalog_item(db, cid, catalog)
+    if meta is None:
+        raise FashionServiceError(
+            "cosmetic_not_found", "时装不存在", status_code=404
+        )
+    canonical_id = canonical_loadout_cosmetic_id(meta, cid) or cid
+    owner_key = _owner_key(canonical_id, catalog)
+
+    def _result(granted: bool) -> dict:
+        # 不让响应谎报「已在衣柜」：按库里真实状态组装（审计 P2-9）
+        in_wardrobe = _in_wardrobe(db, uid, owner_key, catalog)
+        return {
+            "ok": True,
+            "userId": uid,
+            "cosmeticId": canonical_id,
+            "granted": granted,
+            "item": _store_item_dict(meta, owned=True, in_wardrobe=in_wardrobe),
+        }
+
+    if _is_owned(db, uid, owner_key, catalog):
+        _ensure_wardrobe_row(db, uid, owner_key, catalog)
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+        return _result(False)
+
+    now = utcnow()
+    label = str(note or "管理员发放")[:256]
+    # 钱包初始化会 commit，必须在所有写操作之前完成，保证下面一次性提交
+    wallet = get_or_create_wallet(db, uid)
+    db.add(
+        FashionOwnershipModel(
+            id=str(uuid_lib.uuid4()),
+            user_id=uid,
+            cosmetic_id=owner_key[:256],
+            price_paid=0,
+            source="admin_grant",
+            order_no=str(uuid_lib.uuid4()),
+            note=label,
+            granted_by=str(operator_user_id) if operator_user_id else None,
+            acquired_at=now,
+        )
+    )
+    _append_transaction(
+        db,
+        user_id=uid,
+        delta=0,
+        balance_after=int(getattr(wallet, "balance", 0) or 0),
+        tx_type="grant",
+        cosmetic_id=owner_key,
+        cosmetic_name=str(meta.get("name") or ""),
+        note=label,
+        operator_user_id=operator_user_id,
+    )
+    _ensure_wardrobe_row(db, uid, owner_key, catalog)
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        # 并发：另一请求先发放了。回滚后复查所有权，必要时补回衣柜再返回幂等结果。
+        if _is_owned(db, uid, owner_key, catalog):
+            _ensure_wardrobe_row(db, uid, owner_key, catalog)
+            try:
+                db.commit()
+            except IntegrityError:
+                db.rollback()
+        return _result(False)
+    logger.info(
+        "fashion mango: admin grant user={} cid={} operator={}",
+        uid, canonical_id, operator_user_id,
+    )
+    return _result(True)
+

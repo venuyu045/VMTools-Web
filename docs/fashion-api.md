@@ -3,6 +3,14 @@
 > 面向 **mod 开发者**。后端实现见 `backend/src/vmtools_next/{core/fashion_auth.py,core/fashion_service.py,api/routers/fashion.py}`，
 > 数据表见 `backend/src/vmtools_next/data/models/fashion.py` + `backend/alembic/versions/20261028_fashion.py`。
 
+> **v1.1（2026-11-05）新增「芒果块」代币购买**：目录条目可标价，玩家用芒果块购买后
+> 才获得时装（后端自动写入「我的衣柜」，mod 端 `GET /wardrobe/me` 因此无需改动）。
+> **本文档描述的 mod 侧契约完全不变** —— `GET /catalog` 不新增字段、`GET /wardrobe/me`
+> 响应形状不变，老客户端无需升级。新增的钱包 / 商店 / 管理端接口是**网页专用**，
+> 完整契约见 **[docs/fashion-mango-wallet-api.md](fashion-mango-wallet-api.md) §3**。
+> 对 mod 唯一可见的行为变化：`PUT /loadout` 的 `warnings[].code` 多一种 `not_owned`
+> （付费且未拥有的条目被跳过，语义与 `cosmetic_disabled` 一致，老客户端忽略即可）。
+
 ## 0. TL;DR —— mod 端只需三件事
 
 1. **认证**：`POST /api/fashion/auth/challenge` → 客户端调会话服务器 `join` → `POST /api/fashion/auth/verify` 拿 `token`
@@ -644,6 +652,17 @@ mod 端建议：先看本地 `sha256` 是否已有；没有才下载，下载后
 | `rate_limited` | 429 | challenge / device-approve / device-start 太频繁；响应带 `Retry-After: 60`（秒） |
 | `empty_selection` | 400 | 我的衣柜批量删除时 `cosmeticIds` 去重后为空（§5.4） |
 | `too_many_items` | 400 | 槽位超过 8 个（`PUT /loadout`）；**我的衣柜**批量删除去重后超过 500 条也用这个 code（§5.4） |
+| `not_owned` | — | **v1.1 起仅出现在 `PUT /loadout` 的 `warnings[].code`**：该时装需要芒果块购买、当前账号尚未拥有（见 §14）。与 `cosmetic_disabled` 一样只跳过这一条，不整条失败 |
+| `purchase_required` | 403 | v1.1 网页端：`POST /wardrobe` 想把「付费且未拥有」的时装免费加入衣柜；请先走 `POST /store/purchase`（§14） |
+| `insufficient_mango` | 402 / 400 | 购买时余额不足（402）；管理端扣回金额大于该用户余额（400）。`message` 为中文提示 |
+| `not_purchasable` | 409 | 目录条目被管理端设为「不可售卖」，仅能由管理端发放 |
+| `invalid_price` | 400 | 管理端设置的价格不是 0..1_000_000 的整数 |
+| `invalid_amount` | 400 | 管理端调整数量不是 ±1..1_000_000 的非零整数 |
+| `invalid_client_request_id` | 400 | 购买幂等键超过 64 字符或含非法字符 |
+| `idempotency_key_conflict` | 409 | 同一个 `clientRequestId` 被用于购买另一件时装 |
+| `user_not_found` | 404 | 管理端发放/调整时目标网站账号不存在 |
+| `recharge_not_available` | 501 | 充值接口预留、本期未开放（§14） |
+| `purchase_rate_limited` | 429 | 购买接口每用户 60s 内超过 20 次；响应带 `Retry-After: 60` |
 
 ---
 
@@ -659,6 +678,14 @@ mod 端建议：先看本地 `sha256` 是否已有；没有才下载，下载后
 | POST | `/api/fashion/admin/assets` | `multipart/form-data`：`file` + `pack_id` + `version` + `cosmetic_id`（带 cosmetic_id 时自动回填 sha256/bytes） |
 | POST | `/api/fashion/admin/packs` | **发布时装包**：`multipart/form-data`：`file`（.zip）+ `pack_id` + `version`；返回 `{ok, pack:{…}}`（§6 的清单项） |
 | DELETE | `/api/fashion/admin/packs/{packId}/{version}` | 下架时装包（`pack_in_use` → 409） |
+| GET | `/api/fashion/admin/wallet/users?keyword=&limit=&offset=` | v1.1：用户芒果块钱包列表（按 gameId / displayName 搜索） |
+| POST | `/api/fashion/admin/wallet/adjust` | v1.1：发放/扣回芒果块 `{userId, delta, note?}`；充值开放前唯一入金途径，写操作者审计 |
+| POST | `/api/fashion/admin/wallet/grant-cosmetic` | v1.1：直接给用户发放一件时装（不扣币，自动加入衣柜） |
+
+**v1.1 目录定价**：`POST/PUT /admin/catalog` 的请求与 `GET /admin/catalog` 的响应新增
+`priceMango`（整数，0 = 免费，上限 1_000_000）与 `purchasable`（布尔）。不设价时
+`priceMango=0`，行为与上线前完全一致。`purchasable=false` 的条目商店不售卖、只能由
+管理端发放。详见 [fashion-mango-wallet-api.md](fashion-mango-wallet-api.md) §3.3。
 
 资产限制：≤64MB，扩展名白名单（png/jpg/jpeg/webp/gif/glb/gltf/bin/ogg/wav/json/zip/bbmodel），
 同 `sha256` + 文件名 + packId + version 自动去重（**同内容不同文件名会各存一份**，历史行为；
@@ -776,3 +803,64 @@ curl -s -X POST $BASE/loadouts/resolve -H "Authorization: Bearer $TOKEN" -H 'Con
    `curl -s /api/fashion/packs | grep signature` 确认签名真的生效。
 8. **下架不等于远程删除**：`DELETE /admin/packs/{id}/{version}` 只从清单移除，
    玩家本地已下载的包不受影响（需要时让玩家 `/vmfashion cache clear`）。
+9. **v1.1 芒果块（2026-11-05）**：新增迁移 `20261105_fashion_mango` 会给
+   `fashion_catalog` 补 `price_mango` / `purchasable` 两列、建 3 张表（钱包 / 所有权 /
+   流水），并把历史 `fashion_wardrobe` 回填成 `legacy_wardrobe` 所有权（不追溯收费）。
+   ⚠️ 同第 4 条：`create_all` **不会给已存在的表加列**，老库必须跑一次
+   `alembic upgrade head`。`db.py::_run_lightweight_migrations` 有幂等 `ALTER TABLE`
+   兜底（覆盖未跑迁移的开发机），服务层 `ensure_legacy_ownership()` 还有懒回填兜底。
+   核对：`sqlite3 <db> ".schema fashion_catalog" | grep price_mango`。
+
+---
+
+## 14. 芒果块代币购买（v1.1，网页端）
+
+> **完整契约（含全部请求/响应 JSON、错误码、幂等与并发设计、数据迁移）见
+> [docs/fashion-mango-wallet-api.md](fashion-mango-wallet-api.md)。** 本节只给 mod
+> 开发者一个「这是什么、对我有什么影响」的最小摘要。
+
+**货币**：芒果块，整数，余额恒非负。一个网站账号一个钱包，收支逐笔记流水。
+
+**获得时装的链路（v1.1 起）**：
+
+```
+管理端给目录条目设价（priceMango>0）
+  → 玩家在商店页用芒果块 POST /store/purchase
+  → 后端在同一事务里：条件扣款 + 写 fashion_ownership + 写流水 + 自动写 fashion_wardrobe
+  → mod 端 GET /wardrobe/me 照常读到这件时装（契约不变）
+  → PUT /loadout 穿戴
+```
+
+**对 mod 的影响（只有三点，都是向后兼容）**：
+
+1. `GET /catalog` / `GET /wardrobe/me` / `GET /packs` / `GET /assets` 的响应形状
+   **一个字段都没变**。定价只出现在网页专用的 `GET /store/items`。
+2. `PUT /loadout` 的 `warnings[].code` 多一种 `not_owned`：付费且未拥有的条目被跳过
+   （与 `cosmetic_disabled` 同款「部分成功」语义）。老客户端忽略未知 warning 即可。
+   未绑定网站账号的 mod token（`user_id` 为空）**不做该校验**，行为完全不变。
+3. 玩家「买过」的权利存在 `fashion_ownership`，删衣柜收藏不会失去；再点一次购买
+   会免费把它加回衣柜。上线前已收藏的时装自动继承所有权，不会追溯收费。
+
+**充值**：本期只保留接口形状。`GET /wallet/recharge/options` 返回
+`available=false`，`POST /wallet/recharge` 固定 501 `recharge_not_available`；
+后续接支付不改前端契约。充值开放前由 `POST /admin/wallet/adjust` 发放。
+
+**新增端点一览**（网页 JWT；管理端需 site_admin）：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/fashion/wallet` | 我的余额（首次访问自动建钱包） |
+| GET | `/api/fashion/wallet/transactions` | 收支明细（分页） |
+| GET | `/api/fashion/wallet/recharge/options` | 充值入口信息（本期 available=false） |
+| POST | `/api/fashion/wallet/recharge` | 充值（预留，501） |
+| GET | `/api/fashion/store/items` | 目录 + 定价 + 拥有/衣柜状态 + 余额（一次拿全） |
+| POST | `/api/fashion/store/purchase` | 购买 / 免费领取（幂等，自动加入衣柜） |
+| GET | `/api/fashion/store/orders` | 购买记录（所有权维度） |
+| GET | `/api/fashion/admin/wallet/users` | 用户钱包列表 |
+| POST | `/api/fashion/admin/wallet/adjust` | 发放 / 扣回芒果块 |
+| POST | `/api/fashion/admin/wallet/grant-cosmetic` | 直接发放时装 |
+
+**表**：`fashion_wallet`（余额）、`fashion_ownership`（已获得，唯一
+`(user_id, cosmetic_id)`）、`fashion_mango_transaction`（流水，含幂等键）；
+`fashion_catalog` 加 `price_mango` / `purchasable` 两列。迁移见
+`backend/alembic/versions/20261105_fashion_mango.py`。

@@ -13,6 +13,16 @@
       <span class="logo-text" v-show="!collapsed">时装中心</span>
     </div>
 
+    <!-- 🥭 芒果块余额：所有时装页共用这一个侧边栏实例，只在挂载时读一次 wallet()；
+         读失败静默降级显示「—」，不阻塞导航。折叠态（含移动端）仍显示数字。 -->
+    <div class="sidebar-wallet">
+      <MangoWalletPanel
+        :balance="mangoBalance"
+        :loading="mangoLoading"
+        :compact="!!collapsed"
+      />
+    </div>
+
     <!-- 时装中心专属导航：只保留时装相关内容 -->
     <nav class="sidebar-nav" aria-label="时装中心导航">
       <div class="nav-group">
@@ -77,9 +87,11 @@
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, onMounted, onUnmounted } from 'vue'
 import { useRoute } from 'vue-router'
 import { useAuthStore } from '@/stores/auth'
+import MangoWalletPanel from '@/components/fashion/MangoWalletPanel.vue'
+import { useMangoWallet } from '@/components/fashion/useMangoWallet'
 
 /** 时装中心导航项（顺序即展示顺序） */
 interface FashionNavItem {
@@ -101,6 +113,25 @@ const emit = defineEmits<{
 
 const route = useRoute()
 const authStore = useAuthStore()
+
+/**
+ * 芒果块余额（任务 A4）。
+ *
+ * 只在**本组件挂载时**读一次：FashionSidebar 挂在 AppLayout 上，切换时装路由时
+ * 组件实例不变（不会重新 onMounted），所以不会「每次路由切换都重复并发请求」。
+ * `useMangoWallet()` 内部还有「已读就不重复请求 + 在飞请求复用 + seq 竞态 +
+ * 会话切换重读 + 卸载保护」；这里再留一个 isUnmounted 标记，保证卸载后即使
+ * 请求回来也不写任何状态、不弹提示。
+ */
+const { mangoBalance, mangoLoading, ensureWallet } = useMangoWallet()
+let isUnmounted = false
+onMounted(() => {
+  if (isUnmounted) return
+  void ensureWallet()
+})
+onUnmounted(() => {
+  isUnmounted = true
+})
 
 const collapseIcon = computed(() => {
   if (props.isMobile) return '✕'
@@ -164,6 +195,25 @@ function isActive(item: { path: string }): boolean {
   align-items: center;
   gap: 10px;
   min-height: 56px;
+}
+
+/* 芒果块余额卡片：折叠态仍显示数字；窄栏内不横向溢出 */
+.sidebar-wallet {
+  padding: 10px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  flex-shrink: 0;
+}
+
+.sidebar-wallet :deep(.mango-wallet-panel) {
+  width: 100%;
+}
+
+.sidebar.collapsed .sidebar-wallet {
+  padding: 8px 6px;
+}
+
+.sidebar.collapsed .sidebar-wallet :deep(.mango-balance) {
+  font-size: 11px;
 }
 
 .collapse-btn {

@@ -28,17 +28,30 @@ mod（Bearer fashion token）::
     PUT    /api/fashion/loadout                  （衣柜页保存，同一套接口）
     GET    /api/fashion/loadout/me
     GET    /api/fashion/wardrobe                 （我的衣柜，user 维度收藏）
-    POST   /api/fashion/wardrobe                 （加入衣柜，幂等）
+    POST   /api/fashion/wardrobe                 （加入衣柜，幂等；付费时装需先购买）
     DELETE /api/fashion/wardrobe/{cosmeticId}    （单件删除）
     POST   /api/fashion/wardrobe/batch-delete    （批量删除）
 
+芒果块钱包 / 商店（网页 JWT；契约见 docs/fashion-mango-wallet-api.md）::
+
+    GET    /api/fashion/wallet
+    GET    /api/fashion/wallet/transactions
+    GET    /api/fashion/wallet/recharge/options  （充值入口信息，本期 available=false）
+    POST   /api/fashion/wallet/recharge          （预留：本期固定 501）
+    GET    /api/fashion/store/items              （目录 + 定价 + 拥有/衣柜状态 + 余额）
+    POST   /api/fashion/store/purchase           （芒果块购买 / 免费领取）
+    GET    /api/fashion/store/orders             （购买记录）
+
 管理端（site_admin）::
 
-    GET/POST      /api/fashion/admin/catalog
+    GET/POST      /api/fashion/admin/catalog      （含 priceMango / purchasable）
     PUT/DELETE    /api/fashion/admin/catalog/{cosmeticId}
     GET/POST      /api/fashion/admin/assets
     POST          /api/fashion/admin/packs       （上传/发布整包 zip）
     DELETE        /api/fashion/admin/packs/{id}/{version} （下架）
+    GET           /api/fashion/admin/wallet/users
+    POST          /api/fashion/admin/wallet/adjust      （发放/扣回芒果块）
+    POST          /api/fashion/admin/wallet/grant-cosmetic（直接发放时装）
 
 鉴权：``Authorization: Bearer <token>``。token 可以是 mod 的 fashion token
 （``aud=fashion``）或网页登录 JWT（``sub`` = 用户 id）；网页 JWT 通过
@@ -64,6 +77,11 @@ from starlette.concurrency import run_in_threadpool
 
 from vmtools_next.api.deps import get_current_user, get_db, require_site_admin
 from vmtools_next.api.schemas.fashion import (
+    AdminGrantCosmeticRequest,
+    AdminGrantCosmeticResponse,
+    AdminWalletAdjustRequest,
+    AdminWalletAdjustResponse,
+    AdminWalletUserListResponse,
     AssetListResponse,
     AssetOut,
     AssetUploadResponse,
@@ -86,13 +104,24 @@ from vmtools_next.api.schemas.fashion import (
     LoadoutPutResponse,
     LoadoutWarning,
     LoadoutResponse,
+    MANGO_CURRENCY_NAME,
     PackItem,
     PackUploadResponse,
     PacksResponse,
+    PurchaseOrderListResponse,
+    PurchaseRequest,
+    PurchaseResponse,
+    RechargeOptionsResponse,
+    RechargeRequest,
+    RechargeResponse,
     ResolveRequest,
     ResolveResponse,
+    StoreItem,
+    StoreItemsResponse,
     VerifyRequest,
     VerifyResponse,
+    WalletOut,
+    WalletTransactionListResponse,
     WardrobeAddRequest,
     WardrobeAddResponse,
     WardrobeBatchDeleteRequest,
@@ -130,11 +159,13 @@ _CHALLENGE_WINDOW = 60.0
 _CHALLENGE_LIMIT = 20
 
 
-def _rate_limited(message: str, retry_after: int = 60) -> HTTPException:
+def _rate_limited(
+    message: str, retry_after: int = 60, *, code: str = "rate_limited"
+) -> HTTPException:
     """统一的 429：带 ``Retry-After``（mod 的 RetryPolicy 会按它等待，最多 60s）。"""
     return HTTPException(
         status_code=429,
-        detail={"code": "rate_limited", "message": message},
+        detail={"code": code, "message": message},
         headers={"Retry-After": str(int(retry_after))},
     )
 
@@ -155,13 +186,14 @@ def _check_rate(
     window: float,
     limit: int,
     message: str,
+    code: str = "rate_limited",
 ) -> None:
     """滑动窗口限流（进程内；多 worker 部署时各进程独立，见 docs §11/§13）。"""
     now = time.monotonic()
     with _RATE_LOCK:
         hits = [t for t in store.get(key, []) if now - t < window]
         if len(hits) >= limit:
-            raise _rate_limited(message, int(window))
+            raise _rate_limited(message, int(window), code=code)
         hits.append(now)
         store[key] = hits
         if len(store) > 5000:  # 防内存膨胀：清掉过期 key
@@ -208,6 +240,21 @@ def _check_device_start_rate(key: str) -> None:
         window=_DEVICE_START_WINDOW,
         limit=_DEVICE_START_LIMIT,
         message="绑定码申请过于频繁，请稍后再试",
+    )
+
+
+# ── 购买限流（每个用户一个滑动窗口；防脚本刷接口 / 放大 DB 写压力）──────
+_PURCHASE_HITS: dict[str, list[float]] = {}
+
+
+def _check_purchase_rate(user_id: str) -> None:
+    _check_rate(
+        _PURCHASE_HITS,
+        user_id,
+        window=svc.PURCHASE_RATE_WINDOW,
+        limit=svc.PURCHASE_RATE_LIMIT,
+        message="购买操作过于频繁，请稍后再试",
+        code="purchase_rate_limited",
     )
 
 
@@ -493,6 +540,9 @@ def put_loadout(
             db,
             getattr(identity, "id", ""),
             [item.model_dump(by_alias=True, exclude_unset=True) for item in body.items],
+            # v1.1：网页登录态 / 已绑定账号的 mod token 会带 user_id，用于
+            # 「付费时装未购买不能穿」的校验；未绑定的 mod token 传 None 跳过。
+            user_id=getattr(principal, "user_id", None),
         )
     except FashionServiceError as exc:
         raise _http_error(exc)
@@ -641,6 +691,224 @@ def delete_wardrobe_item(
     """
     removed = svc.remove_wardrobe_item(db, str(user.id), cosmetic_id)
     return WardrobeRemoveResponse(ok=True, removed=removed)
+
+
+# ── 芒果块钱包 / 代币购买（网页 JWT）─────────────────────────────────────
+#
+# 契约：docs/fashion-mango-wallet-api.md
+# 货币叫「芒果块」，整数，余额恒非负。充值通道本期只保留接口形状：
+# ``GET /wallet/recharge/options`` 返回 available=false，``POST /wallet/recharge``
+# 固定 501；后续接支付时只需实现入账并把 available 打开，前端不用改契约。
+# 管理端发放是本期唯一的入金途径。
+
+_RECHARGE_NOTICE = "充值通道即将开放，目前可联系管理员发放芒果块"
+# 501 的 message 与 /wallet/recharge/options 的 notice 分开：前者是「操作结果」，
+# 后者是「入口说明」，不要混用（契约 §3.1 与 docs/fashion-mango-wallet-api.md）。
+_RECHARGE_501_MESSAGE = "充值通道即将开放，敬请期待"
+
+
+@router.get("/wallet", response_model=WalletOut)
+def get_my_wallet(
+    user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> WalletOut:
+    """我的芒果块余额（首次访问自动创建余额 0 的钱包）。"""
+    return WalletOut(**svc.get_wallet(db, str(user.id)))
+
+
+@router.get("/wallet/transactions", response_model=WalletTransactionListResponse)
+def list_my_transactions(
+    limit: int = Query(svc.DEFAULT_LIST_LIMIT, ge=1),
+    offset: int = Query(0, ge=0),
+    user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> WalletTransactionListResponse:
+    """芒果块收支明细（按时间倒序，分页，limit 最大 100）。"""
+    payload = svc.list_transactions(db, str(user.id), limit=limit, offset=offset)
+    return WalletTransactionListResponse(**payload)
+
+
+@router.get("/wallet/recharge/options", response_model=RechargeOptionsResponse)
+def recharge_options(
+    _: UserModel = Depends(get_current_user),
+) -> RechargeOptionsResponse:
+    """充值入口信息（本期恒 ``available=false``，channels 为空）。
+
+    前端「充值」弹窗只读这个接口决定渲染什么，不硬编码占位文案；接入支付后
+    后端把 channels / available 填上，前端无需发版。
+    """
+    return RechargeOptionsResponse(
+        available=False,
+        currency=MANGO_CURRENCY_NAME,
+        channels=[],
+        notice=_RECHARGE_NOTICE,
+    )
+
+
+@router.post("/wallet/recharge", response_model=RechargeResponse)
+def recharge_wallet(
+    body: RechargeRequest,
+    _: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> RechargeResponse:
+    """**预留接口**：本期不接支付，固定 501，接口形状先定死。
+
+    后续实现点（保持请求/响应形状不变）：
+
+    1. 校验 ``amount``（正整数、单次上限）与 ``channel`` 在 channels 白名单内；
+    2. 创建订单并拉起支付，回调验签成功后用 ``clientRequestId`` 作幂等键调用
+       ``svc.get_or_create_wallet`` + 条件入账 + 写 ``tx_type="recharge"`` 流水；
+    3. 返回 ``RechargeResponse``，并把 ``/wallet/recharge/options`` 的 available 置 true。
+
+    ⚠️ 现在**绝不能**真的入账：没有支付凭证的入金等于无限刷币。
+    """
+    raise HTTPException(
+        status_code=501,
+        detail={"code": "recharge_not_available", "message": _RECHARGE_501_MESSAGE},
+    )
+
+
+@router.get("/store/items", response_model=StoreItemsResponse)
+def list_store_items(
+    category: Optional[str] = None,
+    pack_id: Optional[str] = None,
+    user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> StoreItemsResponse:
+    """商店页聚合数据：目录 + 定价 + 拥有/衣柜状态 + 钱包余额（一次拿全）。
+
+    与 ``GET /catalog`` 的区别：catalog 是 mod 契约、带全站共享缓存、不含用户态；
+    这里按当前登录用户计算 owned/inWardrobe，不能复用那份缓存。
+    """
+    _validate_catalog_filters(category, pack_id)
+    payload = svc.store_items(
+        db, str(user.id), category=category, pack_id=pack_id
+    )
+    return StoreItemsResponse(
+        currency=payload["currency"],
+        wallet=WalletOut(**payload["wallet"]),
+        rechargeAvailable=bool(payload["rechargeAvailable"]),
+        items=[StoreItem(**item) for item in payload["items"]],
+    )
+
+
+@router.post("/store/purchase", response_model=PurchaseResponse)
+def purchase_cosmetic(
+    body: PurchaseRequest,
+    user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PurchaseResponse:
+    """用芒果块购买 / 免费领取一件时装（购买成功自动加入衣柜）。
+
+    幂等：已拥有时返回 ``purchased=false, alreadyOwned=true``，不再扣款；
+    带 ``clientRequestId`` 时重复提交同一 key 直接返回首次结果。
+    错误码见 docs/fashion-mango-wallet-api.md §3.2（402 余额不足 / 404 / 409 / 429）。
+    """
+    _check_purchase_rate(str(user.id))
+    try:
+        payload = svc.purchase(
+            db,
+            str(user.id),
+            body.cosmetic_id,
+            client_request_id=body.client_request_id,
+        )
+    except FashionServiceError as exc:
+        raise _http_error(exc)
+    item = payload.get("item")
+    return PurchaseResponse(
+        ok=bool(payload.get("ok", True)),
+        purchased=bool(payload.get("purchased", False)),
+        alreadyOwned=bool(payload.get("alreadyOwned", False)),
+        free=bool(payload.get("free", False)),
+        priceMango=int(payload.get("priceMango", 0) or 0),
+        balance=int(payload.get("balance", 0) or 0),
+        cosmeticId=str(payload.get("cosmeticId", "") or ""),
+        item=StoreItem(**item) if item else None,
+        transactionId=str(payload.get("transactionId", "") or ""),
+    )
+
+
+@router.get("/store/orders", response_model=PurchaseOrderListResponse)
+def list_my_orders(
+    limit: int = Query(svc.DEFAULT_LIST_LIMIT, ge=1),
+    offset: int = Query(0, ge=0),
+    user: UserModel = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> PurchaseOrderListResponse:
+    """我的购买/获得记录（所有权维度，删衣柜不会消失）。"""
+    payload = svc.list_orders(db, str(user.id), limit=limit, offset=offset)
+    return PurchaseOrderListResponse(**payload)
+
+
+# ── 管理端：芒果块（site_admin）──────────────────────────────────────────
+
+@router.get("/admin/wallet/users", response_model=AdminWalletUserListResponse)
+def admin_list_wallet_users(
+    keyword: str = Query("", max_length=64),
+    limit: int = Query(svc.DEFAULT_LIST_LIMIT, ge=1),
+    offset: int = Query(0, ge=0),
+    _: UserModel = Depends(require_site_admin),
+    db: Session = Depends(get_db),
+) -> AdminWalletUserListResponse:
+    """用户钱包列表（按 gameId / displayName 模糊搜索）。"""
+    payload = svc.admin_wallet_users(
+        db, keyword=keyword, limit=limit, offset=offset
+    )
+    return AdminWalletUserListResponse(**payload)
+
+
+@router.post("/admin/wallet/adjust", response_model=AdminWalletAdjustResponse)
+def admin_adjust_wallet(
+    body: AdminWalletAdjustRequest,
+    admin: UserModel = Depends(require_site_admin),
+    db: Session = Depends(get_db),
+) -> AdminWalletAdjustResponse:
+    """发放 / 扣回芒果块（充值开放前唯一入金途径，写操作者审计）。
+
+    ``delta > 0`` 发放，``delta < 0`` 扣回且不允许把余额扣成负数。
+    """
+    try:
+        payload = svc.admin_adjust_wallet(
+            db,
+            body.user_id,
+            body.delta,
+            operator_user_id=str(admin.id),
+            note=body.note,
+        )
+    except FashionServiceError as exc:
+        raise _http_error(exc)
+    logger.info(
+        "fashion mango admin adjust target={} delta={} operator={}",
+        body.user_id, body.delta, getattr(admin, "id", ""),
+    )
+    return AdminWalletAdjustResponse(**payload)
+
+
+@router.post("/admin/wallet/grant-cosmetic", response_model=AdminGrantCosmeticResponse)
+def admin_grant_cosmetic(
+    body: AdminGrantCosmeticRequest,
+    admin: UserModel = Depends(require_site_admin),
+    db: Session = Depends(get_db),
+) -> AdminGrantCosmeticResponse:
+    """直接给用户发放一件时装（不扣币，自动加入衣柜）：补发 / 活动赠送 / 联调。"""
+    try:
+        payload = svc.admin_grant_cosmetic(
+            db,
+            body.user_id,
+            body.cosmetic_id,
+            operator_user_id=str(admin.id),
+            note=body.note,
+        )
+    except FashionServiceError as exc:
+        raise _http_error(exc)
+    item = payload.get("item")
+    return AdminGrantCosmeticResponse(
+        ok=bool(payload.get("ok", True)),
+        userId=str(payload.get("userId", "") or ""),
+        cosmeticId=str(payload.get("cosmeticId", "") or ""),
+        granted=bool(payload.get("granted", False)),
+        item=StoreItem(**item) if item else None,
+    )
 
 
 # ── 包级下发（公开，mod 自动下发用） ────────────────────────────────────

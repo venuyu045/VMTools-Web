@@ -94,7 +94,7 @@
             在下面输入该码即可完成绑定。
           </p>
 
-          <div class="code-row">
+          <div class="code-row" ref="codeRowRef">
             <el-input
               ref="codeInputRef"
               v-model="userCode"
@@ -105,6 +105,7 @@
               autocomplete="one-time-code"
               :disabled="approving"
               clearable
+              @focus="onCodeFocus"
               @keyup.enter="handleApprove"
             />
             <el-button
@@ -178,7 +179,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { InputInstance } from 'element-plus'
@@ -204,9 +205,21 @@ const approving = ref(false)
 const unbindingId = ref('')
 const lastBound = ref<DeviceApproveResult | null>(null)
 const codeInputRef = ref<InputInstance | null>(null)
+const codeRowRef = ref<HTMLElement | null>(null)
 
 // 身份列表请求竞态保护：刷新与绑定后的重新加载可能并发
 let identitiesSeq = 0
+// P3：组件卸载后网络回来不再写状态 / 不再弹提示
+let isUnmounted = false
+
+/**
+ * 输入框获得焦点后把这一行滚到视口中间（P3）。
+ * 移动端软键盘弹出会压缩可视区（`interactive-widget=resizes-content` 已在
+ * index.html 的 viewport 声明），滚到中间可避免输入框被顶栏 / 键盘遮住。
+ */
+function onCodeFocus(): void {
+  codeRowRef.value?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+}
 
 const normalizedCode = computed(() => userCode.value.replace(/[\s-_]/g, '').toUpperCase())
 
@@ -241,14 +254,14 @@ async function loadIdentities(): Promise<void> {
   identitiesError.value = false
   try {
     const { data } = await fashionApi.myIdentities()
-    if (seq !== identitiesSeq) return // 已被更新的请求取代，丢弃本次响应
+    if (isUnmounted || seq !== identitiesSeq) return // 已被更新的请求取代 / 组件已卸载
     identities.value = data.items || []
   } catch (error) {
-    if (seq !== identitiesSeq) return
+    if (isUnmounted || seq !== identitiesSeq) return
     identitiesError.value = true
     notifyFashionError(error, '读取绑定信息失败')
   } finally {
-    if (seq === identitiesSeq) loadingIdentities.value = false
+    if (!isUnmounted && seq === identitiesSeq) loadingIdentities.value = false
   }
 }
 
@@ -309,8 +322,22 @@ function goWardrobe(identityId: string): void {
 onMounted(() => {
   // C1：进入页面直接聚焦绑定码输入框（原来要点一下才输入）。
   // 放在 loadIdentities 之前：身份列表是网络请求，等它回来再聚焦会让自动聚焦来得太晚。
-  codeInputRef.value?.focus()
+  // P3：移动端**不自动聚焦** —— 挂载即 focus 会立刻弹出软键盘、把页面顶飞；
+  // 用户主动点输入框时由 @focus 的 onCodeFocus 把这一行滚到视口中间。
+  const isMobile =
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(max-width: 768px)').matches
+  if (!isMobile) {
+    codeInputRef.value?.focus()
+    codeRowRef.value?.scrollIntoView({ block: 'center', behavior: 'smooth' })
+  }
   void loadIdentities()
+})
+
+onUnmounted(() => {
+  isUnmounted = true
+  ++identitiesSeq
 })
 </script>
 

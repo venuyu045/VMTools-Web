@@ -130,7 +130,8 @@ npm install
 | **时装中心** | 顶栏「时装中心」入口 → 独立子应用，侧边栏只保留时装内容：**时装商店**（浏览全部目录、加入衣柜）、**我的衣柜**（收藏管理 / 挑选穿戴）、**时装管理**（仅 site_admin）；主站侧边栏不再出现时装入口，底部「返回主站」一键回主站 |
 | **账号绑定** | 游戏内 `/vmfashion bind` 得到 6 位绑定码 → 本站「时装绑定」页输入 → 一个网站账号可绑多个 MC 账号 |
 | **双路认证** | 正版走 `sessionserver.mojang.com`，皮肤站走 Yggdrasil（**只信任白名单内的地址**，防 SSRF）；后端用 `hasJoined` 反查并**比对 UUID**，不做密码登录 |
-| **时装商店** | `/fashion/store`：目录网格（缩略图 / 槽位 / 所属时装包）、搜索、按槽位筛选、分页、详情大图；卡片「加入衣柜」把时装收进自己的衣柜（已在衣柜则变为「去穿戴 →」深链到衣柜并定位该件时装） |
+| **时装商店** | `/fashion/store`：目录网格（缩略图 / 槽位 / 所属时装包）、搜索、按槽位筛选、分页、详情大图；**免费**时装卡片「加入衣柜」把时装收进自己的衣柜（已在衣柜则变为「去穿戴 →」深链到衣柜并定位该件时装）；**付费**时装显示芒果块价格与「购买」按钮 |
+| **芒果块代币购买（v1.1）** | 站内虚拟代币「芒果块」（整数、余额非负）。管理端可给目录条目**定价** / 设「不可售卖」；玩家用芒果块购买后在同一事务里扣款 + 写所有权 + 记流水 + **自动加入衣柜**（mod 端 `GET /wardrobe/me` 因此无需改动）；商店页显示余额、购买确认、购买记录与收支明细；**充值通道本期只留接口**（`POST /wallet/recharge` 固定 501「即将开放」），入金暂由管理端发放/扣减。购买幂等（唯一约束 + `clientRequestId`）、条件 UPDATE 原子扣款防并发超扣、付费未拥有不能加衣柜/穿戴；上线前已收藏的时装自动继承所有权，**不追溯收费**。完整契约见 [`docs/fashion-mango-wallet-api.md`](docs/fashion-mango-wallet-api.md) |
 | **网页衣柜** | `/fashion/wardrobe`：**只显示自己在商店里加入衣柜的时装**（收藏制，不再展示全站目录）；按槽位（披风/翅膀/头饰/背饰/宠物/光环）挑选、调缩放、保存；支持单件移除与**批量管理（勾选 / 全选 / 删除选中，超过后端 500 上限自动分片提交）**；目录里已删除/停用的条目仍显示并标「已下架」（可删不可穿）；进游戏自动生效，游戏内换装也会实时回传 |
 | **时装管理端** | `/fashion/admin`（仅 site_admin）：目录管理（增删改查 / 启用开关 / 排序 / 资产缺失徽标）、资产管理（上传 + 一键填入目录）、时装包（上传 zip 发布 / 下架，409 `pack_in_use` 有专门引导）；上传带进度 / 网速 / ETA 与大小预检 |
 | **批量解析** | 进服时 `POST /loadouts/resolve` 一次最多 200 个 UUID，只回 `assetKey` 级元数据（热路径，5 秒缓存） |
@@ -146,9 +147,10 @@ npm install
 - 后端路由：`backend/src/vmtools_next/api/routers/fashion.py`，前缀 **`/api/fashion`**
   - 公开：`/auth/challenge`、`/auth/verify`、`/packs`、`/packs/{id}/{version}/download`、`/assets/{assetKey}`
   - mod（Bearer token）：`/loadout`（PUT）、`/loadout/me`、`/loadouts/resolve`、`/catalog`、`/device/*`、`/wardrobe/me`（游戏内衣柜按收藏过滤）
-  - 网站（网页 JWT）：`/wardrobe`（GET/POST/DELETE）、`/wardrobe/batch-delete`、`/identities/me`、`/device/approve`
-  - 管理端（site_admin）：`/admin/catalog`、`/admin/assets`、`/admin/packs`（上下架）
-- 完整契约（含每个端点的字段表、错误码、签名规范、curl 自测）：[`docs/fashion-api.md`](docs/fashion-api.md)
+  - 网站（网页 JWT）：`/wardrobe`（GET/POST/DELETE）、`/wardrobe/batch-delete`、`/identities/me`、`/device/approve`、`/wallet`、`/wallet/transactions`、`/wallet/recharge/options`、`/wallet/recharge`（预留 501）、`/store/items`、`/store/purchase`、`/store/orders`
+  - 管理端（site_admin）：`/admin/catalog`（含 `priceMango` / `purchasable`）、`/admin/assets`、`/admin/packs`（上下架）、`/admin/wallet/users`、`/admin/wallet/adjust`、`/admin/wallet/grant-cosmetic`
+- 完整契约（含每个端点的字段表、错误码、签名规范、curl 自测）：[`docs/fashion-api.md`](docs/fashion-api.md)（mod 侧）；
+  [`docs/fashion-mango-wallet-api.md`](docs/fashion-mango-wallet-api.md)（芒果块代币购买，网页侧）
 
 ### 服务端配置
 
@@ -166,8 +168,8 @@ npm install
 
 ### 数据与迁移
 
-- 表：`fashion_identity`（已验证的 MC 身份）、`fashion_catalog`（时装目录）、`fashion_loadout`（穿戴，`(identity_id, slot)` 唯一）、`fashion_asset`（资产，按 sha256 去重；**时装包清单从 `.zip` 资产行派生，无需新表**）、`fashion_wardrobe`（我的衣柜收藏，`(user_id, cosmetic_id)` 唯一；`cosmetic_id` 故意不做外键，删目录不清空玩家衣柜）
-- 迁移：`backend/alembic/versions/20261028_fashion.py`、`20261101_fashion_wardrobe.py`（`alembic upgrade head`；`init_db()` 的 `create_all` 也会建表）
+- 表：`fashion_identity`（已验证的 MC 身份）、`fashion_catalog`（时装目录，**v1.1 起含 `price_mango` / `purchasable`**）、`fashion_loadout`（穿戴，`(identity_id, slot)` 唯一）、`fashion_asset`（资产，按 sha256 去重；**时装包清单从 `.zip` 资产行派生，无需新表**）、`fashion_wardrobe`（我的衣柜收藏，`(user_id, cosmetic_id)` 唯一；`cosmetic_id` 故意不做外键，删目录不清空玩家衣柜）、`fashion_wallet`（v1.1 芒果块余额，一账号一行）、`fashion_ownership`（v1.1 已获得时装，`(user_id, cosmetic_id)` 唯一，删收藏不丢权利）、`fashion_mango_transaction`（v1.1 收支流水，含幂等键）
+- 迁移：`backend/alembic/versions/20261028_fashion.py`、`20261101_fashion_wardrobe.py`、`20261103_fashion_asset_storage_path_index.py`、`20261105_fashion_mango.py`（`alembic upgrade head`；`init_db()` 的 `create_all` 也会建表）。⚠️ **`create_all` 不给已存在的表加列/加索引**，老库必须跑一次 `alembic upgrade head`：`20261103_*` 补 `fashion_asset.storage_path` 索引、`20261105_*` 补 `fashion_catalog` 两列 + 建 3 表 + 历史衣柜所有权回填。`db.py::_run_lightweight_migrations` 有幂等 `ALTER TABLE` 兜底，服务层 `ensure_legacy_ownership()` 还有懒回填兜底。
 - 资产目录：`data/fashion-assets/`（见该目录下 README）
 
 ### 发布时装包（管理员）
@@ -202,8 +204,11 @@ curl -s -X DELETE $BASE/admin/packs/wings/1.2.0 -H "Authorization: Bearer $TOKEN
 4. **签名与严格模式**：`cryptography` 已随部署依赖安装（`pip install -e ".[signing]"`，Docker 为 `.[dev,signing]`）；
    配置 `VMT_FASHION__PACK_SIGNING_KEY_B64` 后清单即带 `signature`。**在确认签名生效之前不要**让玩家在客户端开
    `requireSignature`，否则会拒绝全部服务端包。
-5. **测试**：`pytest tests/test_fashion_*.py -q`（**250 条用例 + 42 subtests**，覆盖认证 / 契约 / 包级下发 /
-   zip 安全校验 / Ed25519 真签真验 / TestClient 管理端 401·403 / HEAD 下载头 / 衣柜收藏制与 `/wardrobe/me`）。
+5. **测试**：`pytest tests/test_fashion_*.py -q`（**324 条用例 + 49 subtests**，覆盖认证 / 契约 / 包级下发 /
+   zip 安全校验 / Ed25519 真签真验 / TestClient 管理端 401·403 / HEAD 下载头 / 衣柜收藏制与 `/wardrobe/me`；
+   其中 `tests/test_fashion_mango.py` 用真实 SQLite + TestClient 覆盖芒果块余额 / 免费领取 / 付费扣款 /
+   402 余额不足 / 幂等 / 并发 / 防绕过 / 管理端发放 / 流水 / 购买记录 / 历史回填 / 充值 501 /
+   Alembic 迁移 upgrade·downgrade·幂等·轻量兜底）。
 
 ## 项目结构
 

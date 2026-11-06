@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StrictInt
 
 
 class FashionSchema(BaseModel):
@@ -109,7 +109,7 @@ class LoadoutWarning(FashionSchema):
 
     slot: str
     cosmetic_id: str = Field(..., alias="cosmeticId")
-    code: str = Field(..., description="unknown_cosmetic | cosmetic_disabled")
+    code: str = Field(..., description="unknown_cosmetic | cosmetic_disabled | not_owned")
 
 
 class LoadoutPutResponse(FashionSchema):
@@ -287,6 +287,10 @@ class CatalogUpsertRequest(FashionSchema):
     bytes: Optional[int] = None
     enabled: Optional[bool] = None
     sort_order: Optional[int] = Field(default=None, alias="sortOrder")
+    # 芒果块定价（v1.1）。None = 部分更新时不改；0 = 免费。
+    # StrictInt：拒绝 bool / 字符串被 pydantic 静默转成数字（审计 P3-2）。
+    price_mango: Optional[StrictInt] = Field(default=None, alias="priceMango")
+    purchasable: Optional[bool] = None
 
 
 class CatalogAdminItem(FashionSchema):
@@ -299,6 +303,8 @@ class CatalogAdminItem(FashionSchema):
     bytes: int = 0
     enabled: bool = True
     sort_order: int = Field(default=0, alias="sortOrder")
+    price_mango: int = Field(default=0, alias="priceMango")
+    purchasable: bool = True
 
 
 class CatalogAdminResponse(FashionSchema):
@@ -353,3 +359,201 @@ class PacksResponse(FashionSchema):
 class PackUploadResponse(FashionSchema):
     ok: bool = True
     pack: PackItem
+
+
+# ── 芒果块钱包 / 代币购买（v1.1）─────────────────────────────────────────
+#
+# 契约见 docs/fashion-mango-wallet-api.md。所有响应字段 camelCase（与 mod 侧
+# 现有契约一致），错误响应仍是 ``{"detail": {"code","message"}}``。
+# 充值通道本期只保留接口形状：``/wallet/recharge`` 固定返回 501。
+
+MANGO_CURRENCY_NAME = "芒果块"
+
+
+class WalletOut(FashionSchema):
+    """当前用户的芒果块钱包（首次访问自动创建，余额 0）。"""
+
+    balance: int = 0
+    currency: str = MANGO_CURRENCY_NAME
+    total_earned: int = Field(default=0, alias="totalEarned")
+    total_spent: int = Field(default=0, alias="totalSpent")
+    updated_at: Optional[str] = Field(default=None, alias="updatedAt")
+
+
+class WalletTransactionItemOut(FashionSchema):
+    """一条收支流水（按时间倒序）。"""
+
+    id: str
+    # purchase | refund | admin_adjust | recharge | grant
+    type: str = "purchase"
+    delta: int = 0
+    balance_after: int = Field(default=0, alias="balanceAfter")
+    amount_abs: int = Field(default=0, alias="amountAbs")
+    cosmetic_id: str = Field(default="", alias="cosmeticId")
+    cosmetic_name: str = Field(default="", alias="cosmeticName")
+    note: str = ""
+    created_at: Optional[str] = Field(default=None, alias="createdAt")
+
+
+class WalletTransactionListResponse(FashionSchema):
+    items: list[WalletTransactionItemOut] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
+
+
+class RechargeChannel(FashionSchema):
+    """一个充值渠道（本期恒为空数组；接入支付后由后端填充）。"""
+
+    id: str
+    name: str = ""
+    description: str = ""
+    enabled: bool = True
+
+
+class RechargeOptionsResponse(FashionSchema):
+    """``GET /wallet/recharge/options``：充值入口的全部展示信息。"""
+
+    available: bool = False
+    currency: str = MANGO_CURRENCY_NAME
+    channels: list[RechargeChannel] = Field(default_factory=list)
+    notice: str = "充值通道即将开放，目前可联系管理员发放芒果块"
+
+
+class RechargeRequest(FashionSchema):
+    """``POST /wallet/recharge`` 请求（本期返回 501，形状先定死）。"""
+
+    amount: int = 0
+    channel: str = ""
+    # 幂等键：同一用户重复提交同一 key 只会入账一次（接入支付后生效）
+    client_request_id: Optional[str] = Field(default=None, alias="clientRequestId")
+
+
+class RechargeResponse(FashionSchema):
+    """充值成功时的响应形状（本期不会返回，供后续接入支付时复用）。"""
+
+    ok: bool = True
+    balance: int = 0
+    transaction_id: str = Field(default="", alias="transactionId")
+    order_no: str = Field(default="", alias="orderNo")
+
+
+class StoreItem(FashionSchema):
+    """商店条目：目录元数据 + 定价 + 当前用户的拥有/衣柜状态。
+
+    故意**不复用** ``CatalogItem``（那是 mod 契约 ``GET /catalog`` 的响应）：
+    /catalog 带进程内缓存，混入用户维度字段会串号；商店页用独立的
+    ``GET /store/items`` 聚合接口。
+    """
+
+    cosmetic_id: str = Field(..., alias="cosmeticId")
+    name: str = ""
+    category: str = "other"
+    asset_key: str = Field(default="", alias="assetKey")
+    sha256: str = ""
+    bytes: int = 0
+    pack_id: str = Field(default="", alias="packId")
+    sort_order: int = Field(default=0, alias="sortOrder")
+    price_mango: int = Field(default=0, alias="priceMango")
+    purchasable: bool = True
+    owned: bool = False
+    in_wardrobe: bool = Field(default=False, alias="inWardrobe")
+
+
+class StoreItemsResponse(FashionSchema):
+    currency: str = MANGO_CURRENCY_NAME
+    wallet: WalletOut
+    recharge_available: bool = Field(default=False, alias="rechargeAvailable")
+    items: list[StoreItem] = Field(default_factory=list)
+
+
+class PurchaseRequest(FashionSchema):
+    cosmetic_id: str = Field(default="", alias="cosmeticId")
+    # 可选幂等键（<=64 字符）：网络重试 / 用户双击时不会重复扣款
+    client_request_id: Optional[str] = Field(default=None, alias="clientRequestId")
+
+
+class PurchaseResponse(FashionSchema):
+    ok: bool = True
+    # True = 本次真的获得了时装；False = 之前已拥有（幂等，不扣款）
+    purchased: bool = False
+    already_owned: bool = Field(default=False, alias="alreadyOwned")
+    # True = 免费领取（价格 0），不扣款
+    free: bool = False
+    price_mango: int = Field(default=0, alias="priceMango")
+    balance: int = 0
+    cosmetic_id: str = Field(default="", alias="cosmeticId")
+    item: Optional[StoreItem] = None
+    # 扣款流水 id（免费领取 / 已拥有时为空串）
+    transaction_id: str = Field(default="", alias="transactionId")
+
+
+class PurchaseOrderItemOut(FashionSchema):
+    """「购买记录」条目（所有权维度，删衣柜不会消失）。"""
+
+    order_no: str = Field(default="", alias="orderNo")
+    cosmetic_id: str = Field(..., alias="cosmeticId")
+    name: str = ""
+    category: str = "other"
+    pack_id: str = Field(default="", alias="packId")
+    price_paid: int = Field(default=0, alias="pricePaid")
+    # purchase | free_claim | legacy_wardrobe | admin_grant | migration
+    source: str = "purchase"
+    note: str = ""
+    acquired_at: Optional[str] = Field(default=None, alias="acquiredAt")
+    # 目录已删除 / 已停用
+    missing: bool = False
+
+
+class PurchaseOrderListResponse(FashionSchema):
+    items: list[PurchaseOrderItemOut] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
+
+
+class AdminWalletAdjustRequest(FashionSchema):
+    user_id: str = Field(default="", alias="userId")
+    # 正整数 = 发放，负整数 = 扣回；不能为 0。StrictInt 拒绝 bool / 字符串。
+    delta: StrictInt = 0
+    note: str = ""
+
+
+class AdminWalletAdjustResponse(FashionSchema):
+    ok: bool = True
+    user_id: str = Field(default="", alias="userId")
+    balance: int = 0
+    delta: int = 0
+    transaction_id: str = Field(default="", alias="transactionId")
+
+
+class AdminWalletUserItem(FashionSchema):
+    user_id: str = Field(..., alias="userId")
+    game_id: str = Field(default="", alias="gameId")
+    display_name: str = Field(default="", alias="displayName")
+    role: str = ""
+    balance: int = 0
+    total_earned: int = Field(default=0, alias="totalEarned")
+    total_spent: int = Field(default=0, alias="totalSpent")
+
+
+class AdminWalletUserListResponse(FashionSchema):
+    items: list[AdminWalletUserItem] = Field(default_factory=list)
+    total: int = 0
+    limit: int = 20
+    offset: int = 0
+
+
+class AdminGrantCosmeticRequest(FashionSchema):
+    user_id: str = Field(default="", alias="userId")
+    cosmetic_id: str = Field(default="", alias="cosmeticId")
+    note: str = ""
+
+
+class AdminGrantCosmeticResponse(FashionSchema):
+    ok: bool = True
+    user_id: str = Field(default="", alias="userId")
+    cosmetic_id: str = Field(default="", alias="cosmeticId")
+    # False = 该用户之前已拥有（幂等，不重复写入）
+    granted: bool = False
+    item: Optional[StoreItem] = None

@@ -98,15 +98,26 @@
               <el-table-column label="预览" width="72">
                 <template #default="{ row }">
                   <div class="thumb-cell">
+                    <!--
+                      P2-4：停用条目（!row.enabled）的资产必然 404，不渲染 img；
+                      P2-1：破图按 URL 记录；P1-1：viewer 可点遮罩关闭 + 返回键/滚动锁。
+                    -->
                     <el-image
-                      v-if="catalogThumbUrl(row) && !brokenThumbs.has(row.cosmeticId)"
-                      :src="catalogThumbUrl(row) || ''"
+                      v-if="row.enabled && catalogThumbUrl(row) && !brokenThumbUrls.has(catalogThumbUrl(row))"
+                      :src="catalogThumbUrl(row)"
                       :preview-src-list="catalogPreviewList(row)"
                       preview-teleported
+                      hide-on-click-modal
                       fit="contain"
+                      loading="lazy"
+                      fetchpriority="low"
                       class="cell-thumb"
-                      @error="markThumbBroken(row.cosmeticId)"
+                      :alt="displayName(row)"
+                      @show="onViewerShow"
+                      @close="onViewerClose"
+                      @error="markThumbBroken"
                     />
+                    <span v-else-if="!row.enabled" class="thumb-fallback off-fallback">停用</span>
                     <span v-else class="thumb-fallback">{{ (displayName(row) || '?').slice(0, 1) }}</span>
                   </div>
                 </template>
@@ -132,11 +143,26 @@
                   <span class="mono">{{ row.packId || '—' }}</span>
                 </template>
               </el-table-column>
+              <!-- 任务 A3：目录定价 + 是否可购买 -->
+              <el-table-column label="价格（芒果块）" width="128">
+                <template #default="{ row }">
+                  <span class="mono" :class="Number(row.priceMango) > 0 ? 'price-paid' : 'price-free'">
+                    {{ Number(row.priceMango) > 0 ? '🥭 ' + row.priceMango : '免费' }}
+                  </span>
+                </template>
+              </el-table-column>
+              <el-table-column label="可购买" width="86">
+                <template #default="{ row }">
+                  <el-tag :type="row.purchasable === false ? 'info' : 'success'" size="small" effect="plain">
+                    {{ row.purchasable === false ? '否' : '是' }}
+                  </el-tag>
+                </template>
+              </el-table-column>
               <!-- A5：资产缺失必须在表格里直接可见，否则「目录有、衣柜破图」无从发现 -->
               <el-table-column label="资产" width="96">
                 <template #default="{ row }">
                   <el-tag v-if="!row.assetKey" size="small" type="danger" effect="plain">缺资产</el-tag>
-                  <el-tag v-else-if="brokenThumbs.has(row.cosmeticId)" size="small" type="danger" effect="plain">
+                  <el-tag v-else-if="catalogThumbUrl(row) && brokenThumbUrls.has(catalogThumbUrl(row))" size="small" type="danger" effect="plain">
                     文件丢失
                   </el-tag>
                   <el-tag v-else-if="!isImageKey(row.assetKey)" size="small" type="warning" effect="plain">
@@ -218,14 +244,31 @@
               <el-table-column label="预览" width="72">
                 <template #default="{ row }">
                   <div class="thumb-cell">
+                    <!--
+                      P2-3：URL 带 sha256 版本戳；P1-1：viewer 可点遮罩关闭 + 返回键/滚动锁；
+                      P3：补 @error / alt / 失败兜底，坏图不再能点开 viewer；
+                      P1-2：lazy 加载，移动端少解码全尺寸大图。
+                    -->
                     <el-image
-                      v-if="isImageKey(row.filename)"
-                      :src="fashionApi.assetUrl(row.storagePath)"
-                      :preview-src-list="[fashionApi.assetUrl(row.storagePath)]"
+                      v-if="assetThumbUrl(row) && !brokenThumbUrls.has(assetThumbUrl(row))"
+                      :src="assetThumbUrl(row)"
+                      :preview-src-list="[assetThumbUrl(row)]"
                       preview-teleported
+                      hide-on-click-modal
                       fit="contain"
+                      loading="lazy"
+                      fetchpriority="low"
                       class="cell-thumb"
-                    />
+                      :alt="row.filename"
+                      @show="onViewerShow"
+                      @close="onViewerClose"
+                      @error="markThumbBroken"
+                    >
+                      <template #error>
+                        <span class="thumb-fallback mono">失败</span>
+                      </template>
+                    </el-image>
+                    <span v-else-if="isImageKey(row.filename)" class="thumb-fallback mono">失败</span>
                     <span v-else class="thumb-fallback mono">{{ assetKind(row.filename) }}</span>
                   </div>
                 </template>
@@ -350,6 +393,12 @@
             </p>
           </div>
         </el-tab-pane>
+        <!-- ============ 4. 芒果块管理（任务 A3）============ -->
+        <el-tab-pane label="芒果块管理" name="wallet">
+          <div class="pane">
+            <MangoWalletAdmin :cosmetics="catalogRows" />
+          </div>
+        </el-tab-pane>
       </el-tabs>
     </el-card>
 
@@ -357,8 +406,10 @@
     <el-dialog
       v-model="catalogDialog.visible"
       :title="catalogDialog.isEdit ? '编辑时装' : '新建时装'"
-      width="560px"
+      width="min(560px, 92vw)"
       :close-on-click-modal="false"
+      :close-on-press-escape="false"
+      :before-close="catalogBeforeClose"
       destroy-on-close
     >
       <el-form :model="catalogForm" label-width="96px" class="dialog-form">
@@ -396,6 +447,15 @@
             留空则衣柜里显示首字占位。可先去「资产管理」上传，再点「填入目录」自动带过来。
           </p>
         </el-form-item>
+        <!-- 任务 A3：目录定价（0 = 免费，上限 1,000,000）与是否可购买 -->
+        <el-form-item label="价格（芒果块）">
+          <el-input-number v-model="catalogForm.priceMango" :min="0" :max="1000000" :step="1" />
+          <span class="field-hint mono inline">0 = 免费；范围 0 ~ 1,000,000</span>
+        </el-form-item>
+        <el-form-item label="可购买">
+          <el-switch v-model="catalogForm.purchasable" />
+          <span class="field-hint mono inline">关闭后商店不售卖（仅管理端发放），已拥有者仍可穿戴</span>
+        </el-form-item>
         <el-form-item label="排序">
           <el-input-number v-model="catalogForm.sortOrder" :min="0" :max="9999" />
           <span class="field-hint mono inline">数字越小越靠前</span>
@@ -432,7 +492,7 @@
       width="540px"
       :close-on-click-modal="false"
       destroy-on-close
-      @closed="resetUpload"
+      @close="resetUpload"
     >
       <el-form :model="assetForm" label-width="96px" class="dialog-form">
         <el-form-item label="packId">
@@ -500,7 +560,7 @@
       width="520px"
       :close-on-click-modal="false"
       destroy-on-close
-      @closed="resetUpload"
+      @close="resetUpload"
     >
       <el-form :model="packForm" label-width="96px" class="dialog-form">
         <el-form-item label="packId" required>
@@ -546,7 +606,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import type { UploadRawFile, UploadRequestOptions } from 'element-plus'
 import { roleLabel, useAuthStore } from '@/stores/auth'
@@ -565,10 +625,20 @@ import {
   type FashionPack,
 } from '@/api/fashion'
 import { fmtApiTime } from '@/utils/time'
+import MangoWalletAdmin from '@/components/fashion/MangoWalletAdmin.vue'
+import { useResponsivePageSize } from '@/composables/useResponsivePageSize'
+import { useFashionImageViewer } from '@/composables/useFashionImageViewer'
 
 const authStore = useAuthStore()
 
-const activeTab = ref<'catalog' | 'assets' | 'packs'>('catalog')
+// P1-1 + P2-9：两处 el-image 全屏大图统一返回键 / 滚动锁 / 横竖屏重置
+const { onShow: onViewerShow, onClose: onViewerClose } = useFashionImageViewer()
+// P1-3：路由切走后不再写状态 / 弹 toast；上传在卸载时 abort
+let isUnmounted = false
+// P2-10：目录保存响应竞态（旧响应不得关掉刚打开的新弹窗）
+let catalogSaveSeq = 0
+
+const activeTab = ref<'catalog' | 'assets' | 'packs' | 'wallet'>('catalog')
 const refreshing = ref(false)
 const forbidden = ref(false)
 
@@ -586,9 +656,11 @@ const catalogKeyword = ref('')
 const catalogCategory = ref('')
 const catalogPack = ref('')
 const catalogPage = ref(1)
-const pageSize = 20
+// P1-2：移动端少渲染几行（每行一个 44×44 大图请求），避免解码 OOM
+const pageSize = useResponsivePageSize(20, 10)
 const togglingId = ref('')
-const brokenThumbs = ref<Set<string>>(new Set())
+// P2-1：按**失败的 URL**记录破图（旧请求 error 不会误杀换了 sha256 的新预览）
+const brokenThumbUrls = ref<Set<string>>(new Set())
 
 const catalogDialog = reactive({ visible: false, isEdit: false, saving: false })
 const catalogForm = reactive({
@@ -601,6 +673,9 @@ const catalogForm = reactive({
   bytes: 0,
   sortOrder: 0,
   enabled: true,
+  // 任务 A3：定价 / 是否可购买
+  priceMango: 0,
+  purchasable: true,
 })
 
 const filteredCatalogRows = computed(() => {
@@ -617,13 +692,18 @@ const filteredCatalogRows = computed(() => {
 })
 
 const pagedCatalogRows = computed(() => {
-  const start = (catalogPage.value - 1) * pageSize
-  return filteredCatalogRows.value.slice(start, start + pageSize)
+  const start = (catalogPage.value - 1) * pageSize.value
+  return filteredCatalogRows.value.slice(start, start + pageSize.value)
 })
 
 // 搜索 / 筛选变化后回到第一页，否则可能停在一个空页上
 watch([catalogKeyword, catalogCategory, catalogPack], () => {
   catalogPage.value = 1
+})
+// P1-2：视口变化让分页大小改变时把页码夹回有效范围
+watch(pageSize, () => {
+  const maxPage = Math.max(1, Math.ceil(filteredCatalogRows.value.length / pageSize.value))
+  if (catalogPage.value > maxPage) catalogPage.value = maxPage
 })
 
 // ────────────────────── 资产 ──────────────────────
@@ -642,10 +722,16 @@ const assetForm = reactive({ packId: 'default', version: '1', cosmeticId: '' })
  * 缩略图请求）。这里按 50 条前端分页，和「目录管理」同一套页码夹紧规则。
  */
 const assetPage = ref(1)
-const assetPageSize = 50
+// P1-2：资产表同理
+const assetPageSize = useResponsivePageSize(50, 20)
+// 分页大小随视口变化时把资产表页码夹回有效范围
+watch(assetPageSize, () => {
+  const maxPage = Math.max(1, Math.ceil(assets.value.length / assetPageSize.value))
+  if (assetPage.value > maxPage) assetPage.value = maxPage
+})
 const pagedAssets = computed(() => {
-  const start = (assetPage.value - 1) * assetPageSize
-  return assets.value.slice(start, start + assetPageSize)
+  const start = (assetPage.value - 1) * assetPageSize.value
+  return assets.value.slice(start, start + assetPageSize.value)
 })
 
 // ────────────────────── 时装包 ──────────────────────
@@ -720,9 +806,19 @@ function displayName(row: { name?: string; cosmeticId: string }): string {
   return (row.name || '').trim() || row.cosmeticId
 }
 
-function catalogThumbUrl(row: AdminCatalogItem): string | null {
-  if (!row.assetKey || !isImageKey(row.assetKey)) return null
-  return fashionApi.assetUrl(row.assetKey)
+/**
+ * 目录缩略图 URL（P2-3 带 sha256 版本戳，破 immutable 缓存；P2-4 停用条目
+ * 返回空串，模板据此不渲染 img —— 后端对停用 catalog 行 resolve_asset_file 返回 None）。
+ */
+function catalogThumbUrl(row: AdminCatalogItem): string {
+  if (!row.enabled || !row.assetKey || !isImageKey(row.assetKey)) return ''
+  return fashionApi.assetUrl(row.assetKey, row.sha256)
+}
+
+/** 资产表缩略图 URL（同样带版本戳；非图片返回空串） */
+function assetThumbUrl(row: FashionAsset): string {
+  if (!isImageKey(row.filename)) return ''
+  return fashionApi.assetUrl(row.storagePath, row.sha256)
 }
 
 function catalogPreviewList(row: AdminCatalogItem): string[] {
@@ -739,12 +835,16 @@ function assetKind(filename: string): string {
   return (ext || '?').toUpperCase().slice(0, 4)
 }
 
-/** 预览图 404 / 解码失败：记下来，表格里改显示「文件丢失」徽标 */
-function markThumbBroken(cosmeticId: string): void {
-  if (brokenThumbs.value.has(cosmeticId)) return
-  const next = new Set(brokenThumbs.value)
-  next.add(cosmeticId)
-  brokenThumbs.value = next
+/**
+ * 预览图 404 / 解码失败：按真正失败的 src（含 ?v=sha256 版本戳）记录。
+ * P2-1：按 URL 而非 cosmeticId，assetKey/sha256 变化后旧标记自然失效；
+ * el-image 的 @error 收到的是原生 Event，取 e.target.getAttribute('src')。
+ */
+function markThumbBroken(event: Event): void {
+  const el = event.target as HTMLImageElement | null
+  const url = el?.getAttribute('src') || el?.currentSrc || ''
+  if (!url || brokenThumbUrls.value.has(url)) return
+  brokenThumbUrls.value = new Set(brokenThumbUrls.value).add(url)
 }
 
 function fmtBytes(bytes: number | null | undefined): string {
@@ -815,12 +915,13 @@ function adminErrorMessage(error: unknown, fallback: string): string {
  * 这两类不再重复弹。
  */
 function notifyAdminError(error: unknown, fallback: string): void {
-  if (isSilentFashionError(error)) return
+  if (isUnmounted || isSilentFashionError(error)) return
   ElMessage.error(adminErrorMessage(error, fallback))
 }
 
 /** 列表加载失败：403 时切到「无权限」页，其余给 toast（避免一次挂载弹三条重复错误） */
 function handleLoadError(error: unknown, fallback: string): void {
+  if (isUnmounted) return
   if (fashionErrorStatus(error) === 403) {
     forbidden.value = true
     return
@@ -840,18 +941,18 @@ async function loadCatalog(): Promise<void> {
   catalogLoading.value = true
   try {
     const { data } = await fashionApi.adminCatalog()
-    if (seq !== catalogSeq) return
+    if (isUnmounted || seq !== catalogSeq) return
     catalogRows.value = data.items || []
     // 与衣柜页同一条规则：目录重新拉成功 = 资产可能已补齐，缩略图要重试一次
-    brokenThumbs.value = new Set()
+    brokenThumbUrls.value = new Set()
     // 条目变少（删除 / 筛选）时把页码夹回有效范围，避免停在空页
-    const maxPage = Math.max(1, Math.ceil(filteredCatalogRows.value.length / pageSize))
+    const maxPage = Math.max(1, Math.ceil(filteredCatalogRows.value.length / pageSize.value))
     if (catalogPage.value > maxPage) catalogPage.value = maxPage
   } catch (error) {
-    if (seq !== catalogSeq) return
+    if (isUnmounted || seq !== catalogSeq) return
     handleLoadError(error, '读取时装目录失败')
   } finally {
-    if (seq === catalogSeq) catalogLoading.value = false
+    if (!isUnmounted && seq === catalogSeq) catalogLoading.value = false
   }
 }
 
@@ -862,16 +963,16 @@ async function loadAssets(): Promise<void> {
     const { data } = await fashionApi.adminAssets(
       assetPackFilter.value.trim() ? { pack_id: assetPackFilter.value.trim() } : undefined
     )
-    if (seq !== assetSeq) return
+    if (isUnmounted || seq !== assetSeq) return
     assets.value = data.items || []
     // 过滤 / 回读后条数变少时夹紧页码，避免停在空页（与目录管理同一规则）
-    const maxPage = Math.max(1, Math.ceil(assets.value.length / assetPageSize))
+    const maxPage = Math.max(1, Math.ceil(assets.value.length / assetPageSize.value))
     if (assetPage.value > maxPage) assetPage.value = maxPage
   } catch (error) {
-    if (seq !== assetSeq) return
+    if (isUnmounted || seq !== assetSeq) return
     handleLoadError(error, '读取资产列表失败')
   } finally {
-    if (seq === assetSeq) assetLoading.value = false
+    if (!isUnmounted && seq === assetSeq) assetLoading.value = false
   }
 }
 
@@ -880,13 +981,13 @@ async function loadPacks(): Promise<void> {
   packLoading.value = true
   try {
     const { data } = await fashionApi.packs()
-    if (seq !== packSeq) return
+    if (isUnmounted || seq !== packSeq) return
     packs.value = data.packs || []
   } catch (error) {
-    if (seq !== packSeq) return
+    if (isUnmounted || seq !== packSeq) return
     handleLoadError(error, '读取时装包清单失败')
   } finally {
-    if (seq === packSeq) packLoading.value = false
+    if (!isUnmounted && seq === packSeq) packLoading.value = false
   }
 }
 
@@ -902,6 +1003,7 @@ async function refreshActive(): Promise<void> {
   try {
     if (activeTab.value === 'assets') await loadAssets()
     else if (activeTab.value === 'packs') await loadPacks()
+    else if (activeTab.value === 'wallet') return // 芒果块管理自带刷新按钮
     else await loadCatalog()
   } finally {
     refreshing.value = false
@@ -910,6 +1012,8 @@ async function refreshActive(): Promise<void> {
 
 // ────────────────────── 目录：编辑 / 上下架 / 删除 ──────────────────────
 function openCatalogDialog(row: AdminCatalogItem | null): void {
+  // P2-10：每次打开都作废旧在飞的保存响应，避免它回来时关掉刚打开的新弹窗
+  ++catalogSaveSeq
   catalogDialog.isEdit = !!row
   catalogForm.cosmeticId = row?.cosmeticId || ''
   catalogForm.name = row?.name || ''
@@ -920,6 +1024,9 @@ function openCatalogDialog(row: AdminCatalogItem | null): void {
   catalogForm.bytes = row?.bytes || 0
   catalogForm.sortOrder = row?.sortOrder ?? 0
   catalogForm.enabled = row?.enabled ?? true
+  // 任务 A3：定价 / 可购买（老数据可能缺字段，给默认值）
+  catalogForm.priceMango = Number(row?.priceMango) || 0
+  catalogForm.purchasable = row?.purchasable !== false
   catalogDialog.visible = true
 }
 
@@ -946,6 +1053,9 @@ function buildCatalogPayload(): CatalogUpsertPayload {
     assetKey: catalogForm.assetKey.trim(),
     sortOrder: catalogForm.sortOrder,
     enabled: catalogForm.enabled,
+    // 任务 A3：定价 / 是否可购买（POST/PUT 支持部分更新，这里总是带上）
+    priceMango: Math.max(0, Math.min(1000000, Math.trunc(Number(catalogForm.priceMango) || 0))),
+    purchasable: catalogForm.purchasable,
   }
   const name = catalogForm.name.trim()
   // 新建时留空不传：后端会把 name 默认成 cosmeticId（比存空串好）
@@ -1026,6 +1136,19 @@ function validateCatalogCosmeticId(cosmeticId: string, packId: string): string {
   return ''
 }
 
+/**
+ * P2-10：保存期间禁止关闭弹窗（before-close + ESC），并给每次保存一个序号。
+ * 「保存中 ESC / 点 ✕ → 立刻重开新弹窗」时旧响应回来会执行 visible=false 关掉
+ * 新弹窗、还把旧 row 塞回表格；用 seq 比对后旧响应直接作废。
+ */
+function catalogBeforeClose(done: () => void): void {
+  if (catalogDialog.saving) {
+    ElMessage.warning('正在保存，请稍候')
+    return
+  }
+  done()
+}
+
 async function saveCatalog(): Promise<void> {
   const cosmeticId = catalogForm.cosmeticId.trim()
   const packId = catalogForm.packId.trim()
@@ -1034,27 +1157,34 @@ async function saveCatalog(): Promise<void> {
     ElMessage.warning(invalid)
     return
   }
+  const seq = ++catalogSaveSeq
   catalogDialog.saving = true
   try {
     if (catalogDialog.isEdit) {
       const { data } = await fashionApi.adminUpdateCatalog(cosmeticId, buildCatalogPayload())
+      if (isUnmounted || seq !== catalogSaveSeq) return
       const index = catalogRows.value.findIndex((row) => row.cosmeticId === cosmeticId)
       if (index >= 0) catalogRows.value.splice(index, 1, data)
+      // P2-1：局部替换 row 后可能换了 assetKey/sha256，清掉旧破图标记
+      brokenThumbUrls.value = new Set()
       ElMessage.success('已保存')
     } else {
       const { data } = await fashionApi.adminCreateCatalog({
         ...buildCatalogPayload(),
         cosmeticId,
       })
+      if (isUnmounted || seq !== catalogSaveSeq) return
       catalogRows.value = [data, ...catalogRows.value.filter((row) => row.cosmeticId !== data.cosmeticId)]
       catalogPage.value = 1
+      brokenThumbUrls.value = new Set()
       ElMessage.success('已创建')
     }
     catalogDialog.visible = false
   } catch (error) {
+    if (isUnmounted || seq !== catalogSaveSeq) return
     notifyAdminError(error, '保存失败')
   } finally {
-    catalogDialog.saving = false
+    if (seq === catalogSaveSeq) catalogDialog.saving = false
   }
 }
 
@@ -1064,6 +1194,7 @@ async function toggleEnabled(row: AdminCatalogItem, value: string | number | boo
   togglingId.value = row.cosmeticId
   try {
     const { data } = await fashionApi.adminUpdateCatalog(row.cosmeticId, { enabled: next })
+    if (isUnmounted) return
     Object.assign(row, data)
     ElMessage.success(next ? '已上架' : '已下架')
   } catch (error) {
@@ -1086,11 +1217,12 @@ async function removeCatalog(row: AdminCatalogItem): Promise<void> {
   }
   try {
     await fashionApi.adminDeleteCatalog(row.cosmeticId)
+    if (isUnmounted) return
     catalogRows.value = catalogRows.value.filter((item) => item.cosmeticId !== row.cosmeticId)
     // 删掉「最后一页的最后一条」后页码会越界：表格拿到空数组 → 显示 empty-text
     // 「目录里还没有时装」，而分页器还停在已经不存在的第 N 页（用户以为目录被清空了）。
     // 与 loadCatalog 同一条夹紧规则。
-    const maxPage = Math.max(1, Math.ceil(filteredCatalogRows.value.length / pageSize))
+    const maxPage = Math.max(1, Math.ceil(filteredCatalogRows.value.length / pageSize.value))
     if (catalogPage.value > maxPage) catalogPage.value = maxPage
     ElMessage.success('已删除')
   } catch (error) {
@@ -1295,6 +1427,7 @@ async function removePack(pack: FashionPack): Promise<void> {
   }
   try {
     await fashionApi.adminDeletePack(pack.id, pack.version)
+    if (isUnmounted) return
     packs.value = packs.value.filter(
       (item) => !(item.id === pack.id && item.version === pack.version)
     )
@@ -1317,8 +1450,22 @@ async function removePack(pack: FashionPack): Promise<void> {
 onMounted(async () => {
   if (denied.value) return
   await loadCatalog()
-  if (forbidden.value) return
+  if (isUnmounted || forbidden.value) return
   await Promise.all([loadAssets(), loadPacks()])
+})
+
+/**
+ * P1-3：路由切换销毁组件时 EP 不会触发上传弹窗的 @closed，64MB 上传会继续
+ * 跑到 120s 超时、进度回调写已卸载组件、toast 弹在下一个页面。这里真正 abort，
+ * 并作废所有在飞请求（seq++ 让它们的回调全部 return），不再写 reactive 状态。
+ */
+onUnmounted(() => {
+  isUnmounted = true
+  ++catalogSeq
+  ++assetSeq
+  ++packSeq
+  ++catalogSaveSeq
+  resetUpload()
 })
 </script>
 
@@ -1543,6 +1690,23 @@ onMounted(async () => {
   text-underline-offset: 2px;
 }
 
+/* 任务 A3：定价列语义色、停用预览占位 */
+.price-paid {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.price-free {
+  color: var(--success);
+}
+
+.off-fallback {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
 @media (max-width: 900px) {
   .fashion-admin-page {
     padding: var(--space-3);
@@ -1556,6 +1720,16 @@ onMounted(async () => {
   .pane-toolbar {
     flex-direction: column;
     align-items: flex-start;
+  }
+}
+
+/* 目录/资产表格列很多：小屏靠横向滚动查看，不让整页横向溢出 */
+@media (max-width: 768px) {
+  .admin-table {
+    min-width: 640px;
+  }
+  .pane {
+    overflow-x: auto;
   }
 }
 </style>

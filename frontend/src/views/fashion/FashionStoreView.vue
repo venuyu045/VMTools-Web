@@ -4,26 +4,33 @@
       <div>
         <h2 class="page-title">时装商店</h2>
         <p class="page-subtitle mono">
-          浏览站点全部时装 · 点「加入衣柜」收藏后才会出现在「我的衣柜」，穿戴后游戏内 mod 会同步生效
+          浏览站点全部时装 · 免费的直接「加入衣柜」，标价的用 🥭 芒果块购买后自动加入衣柜，穿戴后游戏内 mod 会同步生效
         </p>
       </div>
       <div class="head-actions">
+        <!-- 🥭 芒果块余额（与侧边栏共享同一份状态，购买后实时刷新） -->
+        <MangoWalletPanel :balance="mangoBalance" :loading="mangoLoading" />
+        <el-button size="small" type="primary" plain @click="openRecharge">充值</el-button>
+        <el-button size="small" text @click="openDrawer('orders')">购买记录</el-button>
+        <el-button size="small" text @click="openDrawer('transactions')">收支明细</el-button>
         <span class="stat-chip mono">{{ filteredCatalog.length }} 件</span>
-        <!-- 衣柜件数用「已加入收藏」的集合大小，而不是目录条数：用户在商店页
-             一眼就能确认刚才的「加入衣柜」有没有生效 -->
-        <span class="stat-chip mono" :title="wardrobeError ? '衣柜读取失败，点击「刷新」重试' : '已加入衣柜的时装数量'">
+        <!-- 衣柜件数用「已在衣柜」的条目数：用户一眼就能确认刚才的操作有没有生效 -->
+        <span
+          class="stat-chip mono"
+          :title="loadError ? '商店数据读取失败，点击「刷新」重试' : '已加入衣柜的时装数量'"
+        >
           我的衣柜 {{ wardrobeChipText }}
         </span>
         <el-button
           size="small"
           text
-          :loading="loading || loadingWardrobe"
-          :disabled="loading || loadingWardrobe"
+          :loading="loading"
+          :disabled="loading"
           @click="loadAll"
         >
           刷新
         </el-button>
-        <el-button size="small" type="primary" plain @click="goWardrobe">去我的衣柜</el-button>
+        <el-button size="small" type="primary" plain @click="goWardrobe()">去我的衣柜</el-button>
       </div>
     </div>
 
@@ -54,10 +61,9 @@
           type="error"
           :closable="false"
           show-icon
-          title="时装目录加载失败"
+          title="时装商店加载失败"
         >
           <template #default>
-            <!-- 目录和衣柜是并行加载的：重试时一起重来，避免「目录好了但衣柜还是空的」 -->
             <el-button size="small" text type="primary" @click="loadAll">重试</el-button>
           </template>
         </el-alert>
@@ -79,12 +85,13 @@
                 @click="openDetail(item)"
               >
                 <img
-                  v-if="previewUrls.has(item.cosmeticId) && !brokenThumbs.has(item.cosmeticId)"
-                  :src="previewUrls.get(item.cosmeticId) || ''"
+                  v-if="thumbUrl(item) && !brokenThumbUrls.has(thumbUrl(item))"
+                  :src="thumbUrl(item)"
                   :alt="displayName(item)"
                   loading="lazy"
+                  fetchpriority="low"
                   decoding="async"
-                  @error="markThumbBroken(item.cosmeticId)"
+                  @error="markThumbBroken"
                 />
                 <span v-else class="thumb-fallback">{{ (displayName(item) || '?').slice(0, 1) }}</span>
               </button>
@@ -95,35 +102,22 @@
                   <span v-if="item.packId" class="pack-tag" :title="`时装包：${item.packId}`">
                     {{ item.packId }}
                   </span>
+                  <span class="price-tag" :class="{ 'price-free': priceOf(item) === 0 }">
+                    {{ priceOf(item) > 0 ? '🥭 ' + priceOf(item) : '免费' }}
+                  </span>
                 </div>
                 <div class="item-actions">
                   <el-button size="small" text class="detail-btn" @click="openDetail(item)">详情</el-button>
-                  <div class="action-right">
-                    <!-- 已在衣柜：状态标签 + 去穿戴入口；未加入：主按钮「加入衣柜」 -->
-                    <span v-if="isInWardrobe(item)" class="ward-tag">已在衣柜 ✓</span>
-                    <el-button
-                      v-if="isInWardrobe(item)"
-                      size="small"
-                      text
-                      type="primary"
-                      class="equip-btn"
-                      @click="goWardrobe(item)"
-                    >
-                      去穿戴 →
-                    </el-button>
-                    <el-button
-                      v-else
-                      size="small"
-                      text
-                      type="primary"
-                      class="equip-btn"
-                      :loading="addingIds.has(item.cosmeticId)"
-                      :disabled="addingIds.has(item.cosmeticId)"
-                      @click="addToWardrobe(item)"
-                    >
-                      加入衣柜
-                    </el-button>
-                  </div>
+                  <StoreItemActions
+                    :item="item"
+                    variant="card"
+                    :adding="actionBusyIds.has(item.cosmeticId)"
+                    :purchasing="actionBusyIds.has(item.cosmeticId)"
+                    @add="addToWardrobe(item)"
+                    @buy="openPurchase(item)"
+                    @equip="goWardrobe(item)"
+                    @restore="reAddToWardrobe(item)"
+                  />
                 </div>
               </div>
             </article>
@@ -142,16 +136,18 @@
       </div>
     </el-card>
 
-    <!-- 详情弹窗：先看大图 / 元信息，再决定去衣柜穿戴 -->
+    <!-- 详情弹窗：先看大图 / 元信息，再决定购买 / 加入衣柜 / 去穿戴 -->
     <el-dialog
       v-model="detailOpen"
       :title="detailItem ? displayName(detailItem) : '时装详情'"
-      width="520px"
+      width="min(520px, 92vw)"
       class="detail-dialog"
+      destroy-on-close
+      @open="onDetailOpen"
+      @closed="onDetailClosed"
     >
       <div v-if="detailItem" class="detail-body">
-        <!-- el-image 没有 alt prop（`:alt` 只会落到根 div 上），读屏拿不到名称：
-             由容器给 role=img + aria-label，替大图提供可读的替代文本 -->
+        <!-- 只在真的有预览图时给容器 role=img / aria-label（P3） -->
         <div
           class="detail-preview"
           :role="detailUrl ? 'img' : undefined"
@@ -159,18 +155,36 @@
         >
           <el-image
             v-if="detailUrl"
+            :key="detailUrl"
             :src="detailUrl"
             :preview-src-list="[detailUrl]"
             preview-teleported
+            hide-on-click-modal
             fit="contain"
             class="detail-image"
             :alt="displayName(detailItem)"
-          />
+            @show="onViewerShow"
+            @close="onViewerClose"
+            @error="onDetailImageError"
+            @load="onDetailImageLoad"
+          >
+            <template #placeholder>
+              <div class="detail-placeholder">
+                <span class="loading-spinner" aria-hidden="true"></span>
+                <span>预览加载中…</span>
+              </div>
+            </template>
+            <template #error>
+              <div class="detail-image-error">
+                <span>预览加载失败</span>
+                <el-button size="small" type="primary" @click.stop="retryDetail">重试</el-button>
+              </div>
+            </template>
+          </el-image>
           <span v-else class="detail-fallback">{{ (displayName(detailItem) || '?').slice(0, 1) }}</span>
         </div>
-        <p v-if="!detailUrl" class="detail-hint mono">
-          {{ detailItem.assetKey ? '该资产不是图片格式，网页无法预览。' : '这件时装还没有上传资产（assetKey 为空）。' }}
-        </p>
+        <p v-if="detailUrl" class="zoom-hint mono">点击图片查看大图（可双指缩放 / 点空白处关闭）</p>
+        <p v-if="detailHint" class="detail-hint mono">{{ detailHint }}</p>
         <el-descriptions :column="1" border size="small" class="detail-meta">
           <el-descriptions-item label="ID">
             <span class="mono">{{ detailItem.cosmeticId }}</span>
@@ -181,6 +195,11 @@
           <el-descriptions-item label="时装包">
             <span class="mono">{{ detailItem.packId || '—' }}</span>
           </el-descriptions-item>
+          <el-descriptions-item label="价格">
+            <span :class="priceOf(detailItem) > 0 ? 'detail-price' : 'detail-price-free'">
+              {{ priceOf(detailItem) > 0 ? '🥭 ' + priceOf(detailItem) : '免费' }}
+            </span>
+          </el-descriptions-item>
           <el-descriptions-item label="资源大小">
             <span class="mono">{{ formatBytes(detailItem.bytes) }}</span>
           </el-descriptions-item>
@@ -188,85 +207,119 @@
       </div>
       <template #footer>
         <el-button @click="detailOpen = false">关闭</el-button>
-        <!-- 详情弹窗与卡片同款动作：未加入 → 加入衣柜；已加入 → 状态 + 去穿戴 -->
-        <template v-if="detailItem">
-          <span v-if="isInWardrobe(detailItem)" class="ward-tag dialog-ward-tag">已在衣柜 ✓</span>
-          <el-button
-            v-if="!isInWardrobe(detailItem)"
-            type="primary"
-            :loading="addingIds.has(detailItem.cosmeticId)"
-            :disabled="addingIds.has(detailItem.cosmeticId)"
-            @click="addToWardrobe(detailItem)"
-          >
-            加入衣柜
-          </el-button>
-          <el-button v-else type="primary" @click="goWardrobe(detailItem)">去穿戴 →</el-button>
-        </template>
+        <StoreItemActions
+          v-if="detailItem"
+          :item="detailItem"
+          variant="dialog"
+          :adding="actionBusyIds.has(detailItem.cosmeticId)"
+          :purchasing="purchasing || actionBusyIds.has(detailItem.cosmeticId)"
+          @add="addToWardrobe(detailItem)"
+          @buy="openPurchase(detailItem)"
+          @equip="goWardrobe(detailItem)"
+          @restore="reAddToWardrobe(detailItem)"
+        />
       </template>
     </el-dialog>
+
+    <!-- 购买二次确认 -->
+    <PurchaseDialog
+      v-model="purchaseOpen"
+      :item="purchaseItem"
+      :balance="mangoBalance ?? 0"
+      :submitting="purchasing"
+      :error-text="purchaseError"
+      @confirm="doPurchase"
+      @recharge="onPurchaseRecharge"
+    />
+
+    <!-- 充值（本期占位，501 友好提示） -->
+    <RechargeDialog v-model="rechargeOpen" />
+
+    <!-- 购买记录 / 收支明细 -->
+    <OrderDrawer v-model="drawerOpen" :type="drawerType" />
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage } from 'element-plus'
 import {
   CATEGORY_LABELS,
   FASHION_SLOTS,
   fashionApi,
+  fashionErrorMessage,
+  fashionErrorIsInsufficientMango,
   notifyFashionError,
-  type CatalogItem,
+  type PurchaseResponse,
+  type StoreItem,
 } from '@/api/fashion'
+import MangoWalletPanel from '@/components/fashion/MangoWalletPanel.vue'
+import PurchaseDialog from '@/components/fashion/PurchaseDialog.vue'
+import RechargeDialog from '@/components/fashion/RechargeDialog.vue'
+import OrderDrawer from '@/components/fashion/OrderDrawer.vue'
+import StoreItemActions from '@/components/fashion/StoreItemActions.vue'
+import { useMangoWallet } from '@/components/fashion/useMangoWallet'
+import { useResponsivePageSize } from '@/composables/useResponsivePageSize'
+import { useScrollLock } from '@/composables/useScrollLock'
+import { useFashionImageViewer } from '@/composables/useFashionImageViewer'
 
 const router = useRouter()
 
-const catalog = ref<CatalogItem[]>([])
+// ── 共享钱包状态（与侧边栏同一份；购买后实时刷新）──────────────────────────
+const { mangoBalance, mangoLoading, applyStoreWallet, setMangoBalance } = useMangoWallet()
+const { lock, unlock } = useScrollLock()
+const { onShow: onViewerShow, onClose: onViewerClose } = useFashionImageViewer()
+
+// P1-2：移动端一页少渲染一些全尺寸大图（后端本期无缩略图端点），避免解码 OOM
+const pageSize = useResponsivePageSize(48, 12)
+
+// 商店数据源：GET /store/items 一次拿全目录 + 价格 + 拥有 / 衣柜状态 + 钱包
+const catalog = ref<StoreItem[]>([])
 const keyword = ref('')
 const activeCategory = ref('all')
 const page = ref(1)
-const pageSize = 48
 const loading = ref(false)
 const loadError = ref(false)
-const brokenThumbs = ref<Set<string>>(new Set())
+// P2-1：按**失败的 URL**记录破图，而不是按 cosmeticId；assetKey/sha256 变了 URL
+// 也会变，旧标记的 URL 自然不影响新预览（旧请求的 error 不会误杀新图）
+const brokenThumbUrls = ref<Set<string>>(new Set())
 
 const detailOpen = ref(false)
-const detailItem = ref<CatalogItem | null>(null)
+const detailItem = ref<StoreItem | null>(null)
+const detailRetrySeq = ref(0)
+const detailImageError = ref(false)
 
-// ── 我的衣柜（收藏制）──
-// 商店页只需要知道「哪些 cosmeticId 已经在衣柜里」，所以只存 id 集合，
-// 不缓存整份 WardrobeItem（衣柜页才是它的唯一渲染方）。
-const wardrobeIds = ref<Set<string>>(new Set())
-/**
- * 衣柜里「全局 ID」的 localId 别名集合（`pack:local` → `local`）。
- *
- * 为什么要单独一个集合：目录里可能还有历史**简单 ID** 条目（`backboard`），
- * 而衣柜里存的是同一件时装的**全局 ID**（`example:backboard`，mod 或旧版加入的）。
- * 只做精确匹配时这类条目会一直显示「加入衣柜」，点下去才被后端告知「已经在衣柜里」。
- *
- * 不把简单 ID 直接塞进 `wardrobeIds` 的原因：页头「我的衣柜 N 件」用的是
- * `wardrobeIds.size`，混入别名会把件数算多。
- */
-const wardrobeLocalIds = ref<Set<string>>(new Set())
-const wardrobeError = ref(false)
-const loadingWardrobe = ref(false)
-// 正在「加入衣柜」的 cosmeticId：给按钮上 loading，防连点（同一件重复点只会发一次请求）
-const addingIds = ref<Set<string>>(new Set())
+// 正在异步操作（免费加入 / 补回衣柜）的 cosmeticId：给按钮 loading 防连点
+const actionBusyIds = ref<Set<string>>(new Set())
 
-// 目录请求竞态保护：连点刷新时只采纳最后一次响应
-let catalogSeq = 0
-// 衣柜请求竞态保护：同上
-let wardrobeSeq = 0
+// ── 购买 / 充值 / 记录 ────────────────────────────────────────────────────
+const purchaseOpen = ref(false)
+const purchaseItem = ref<StoreItem | null>(null)
+const purchasing = ref(false)
+const purchaseError = ref('')
+const rechargeOpen = ref(false)
+const drawerOpen = ref(false)
+const drawerType = ref<'orders' | 'transactions'>('orders')
+
+// 请求竞态保护：连点刷新时只采纳最后一次响应
+let storeSeq = 0
+let isUnmounted = false
 
 /** 槽位归一化：后端历史脏数据（大小写 / 未知分类）统一落到 other */
-function itemSlot(item: CatalogItem): string {
+function itemSlot(item: StoreItem): string {
   const category = String(item.category || 'other').trim().toLowerCase()
   return FASHION_SLOTS.some((slot) => slot.value === category) ? category : 'other'
 }
 
 /** 显示名：name 为空时回落 cosmeticId，避免渲染成空白卡片 */
-function displayName(item: CatalogItem): string {
+function displayName(item: StoreItem): string {
   return (item.name || '').trim() || item.cosmeticId
+}
+
+function priceOf(item: StoreItem): number {
+  const value = Number(item.priceMango)
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0
 }
 
 function formatBytes(bytes: number): string {
@@ -275,6 +328,23 @@ function formatBytes(bytes: number): string {
   if (value < 1024) return `${value} B`
   if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
   return `${(value / 1024 / 1024).toFixed(1)} MB`
+}
+
+function newRequestId(): string {
+  return `web-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+/**
+ * 按当前目录重新定位条目（P2-12）。
+ * 详情弹窗 / 购买弹窗持有的是旧数组里的对象引用；目录刷新或下架后必须对
+ * 「仍在当前数据里」的条目操作，否则会对过期 ID 发请求。
+ */
+function resolveItem(cosmeticId: string): StoreItem | null {
+  return catalog.value.find((item) => item.cosmeticId === cosmeticId) || null
+}
+
+function warnStale(): void {
+  ElMessage.warning('这件时装已不在当前目录里，请刷新后再试')
 }
 
 const filteredCatalog = computed(() => {
@@ -290,8 +360,8 @@ const filteredCatalog = computed(() => {
 })
 
 const pagedCatalog = computed(() => {
-  const start = (page.value - 1) * pageSize
-  return filteredCatalog.value.slice(start, start + pageSize)
+  const start = (page.value - 1) * pageSize.value
+  return filteredCatalog.value.slice(start, start + pageSize.value)
 })
 
 const emptyText = computed(() => {
@@ -302,171 +372,306 @@ const emptyText = computed(() => {
     : '该分类下暂无时装'
 })
 
-/** 页头「我的衣柜 N 件」：衣柜没读到时显示「—」，避免把失败渲染成「0 件」误导用户 */
+/** 页头「我的衣柜 N 件」：商店数据没读到时显示「—」，避免把失败渲染成「0 件」 */
 const wardrobeChipText = computed(() =>
-  wardrobeError.value ? '—' : `${wardrobeIds.value.size} 件`
+  loadError.value ? '—' : `${catalog.value.filter((item) => item.inWardrobe).length} 件`
 )
 
-// 预览图只接受图片扩展名；其余资产（glb/json/zip）无法在网页预览
+// P2-3：预览 URL 带 sha256 版本戳，管理员替换资产后不会被 immutable 缓存卡一年
 const previewUrls = computed(() => {
   const map = new Map<string, string>()
   for (const item of catalog.value) {
     if (!item.assetKey) continue
     if (!/\.(png|jpe?g|webp|gif)$/i.test(item.assetKey)) continue
-    map.set(item.cosmeticId, fashionApi.assetUrl(item.assetKey))
+    const url = fashionApi.assetUrl(item.assetKey, item.sha256)
+    if (url) map.set(item.cosmeticId, url)
   }
   return map
 })
 
+function thumbUrl(item: StoreItem): string {
+  return previewUrls.value.get(item.cosmeticId) || ''
+}
+
+/** 详情大图 URL；重试时追加时间戳强制重新请求（P2-2） */
 const detailUrl = computed(() => {
   const item = detailItem.value
   if (!item) return ''
-  return previewUrls.value.get(item.cosmeticId) || ''
+  const base = previewUrls.value.get(item.cosmeticId) || ''
+  if (!base) return ''
+  if (detailRetrySeq.value <= 0) return base
+  return `${base}${base.includes('?') ? '&' : '?'}t=${detailRetrySeq.value}`
 })
+
+/** 区分「没有图片资产」「不是图片格式」「图片加载失败」，不再把 404 说成不是图片 */
+const detailHint = computed(() => {
+  const item = detailItem.value
+  if (!item) return ''
+  if (!item.assetKey) return '这件时装还没有上传资产（assetKey 为空）。'
+  if (!/\.(png|jpe?g|webp|gif)$/i.test(item.assetKey)) {
+    return '该资产不是图片格式（glb / json / zip 等），网页无法预览。'
+  }
+  if (detailImageError.value) {
+    return '预览图加载失败，可点上方「重试」重新加载；若持续失败请联系管理员检查资产文件。'
+  }
+  return ''
+})
+
+/** P2-1：记录真正失败的那个 src，旧请求的 error 不会误杀换了 URL 的新预览 */
+function markThumbBroken(event: Event): void {
+  const el = event.target as HTMLImageElement | null
+  const url = el?.getAttribute('src') || el?.currentSrc || ''
+  if (!url || brokenThumbUrls.value.has(url)) return
+  brokenThumbUrls.value = new Set(brokenThumbUrls.value).add(url)
+}
 
 // 搜索 / 切分类后回到第一页，否则可能停在一个空页上
 watch([keyword, activeCategory], () => {
   page.value = 1
 })
+// 视口变化导致 pageSize 改变时把页码夹回有效范围（P1-2）
+watch(pageSize, () => {
+  const maxPage = Math.max(1, Math.ceil(filteredCatalog.value.length / pageSize.value))
+  if (page.value > maxPage) page.value = maxPage
+})
 
-function markThumbBroken(cosmeticId: string): void {
-  if (brokenThumbs.value.has(cosmeticId)) return
-  const next = new Set(brokenThumbs.value)
-  next.add(cosmeticId)
-  brokenThumbs.value = next
+function openDetail(item: StoreItem): void {
+  const current = resolveItem(item.cosmeticId)
+  if (!current) {
+    warnStale()
+    return
+  }
+  detailRetrySeq.value = 0
+  detailImageError.value = false
+  detailItem.value = current
+  detailOpen.value = true
 }
 
-function openDetail(item: CatalogItem): void {
-  detailItem.value = item
-  detailOpen.value = true
+function onDetailOpen(): void {
+  lock('store-detail')
+}
+
+function onDetailClosed(): void {
+  unlock('store-detail')
+  // P2-12 / P3：关闭后清掉引用，避免对着过期条目操作
+  detailItem.value = null
+  detailRetrySeq.value = 0
+  detailImageError.value = false
+}
+
+function onDetailImageError(): void {
+  detailImageError.value = true
+}
+
+function onDetailImageLoad(): void {
+  detailImageError.value = false
+}
+
+function retryDetail(): void {
+  detailImageError.value = false
+  detailRetrySeq.value = Date.now()
+}
+
+/** 目录刷新后让详情弹窗跟着换成新数组里的同一个条目（或关掉） */
+function syncDetailWithCatalog(): void {
+  const current = detailItem.value
+  if (!current) return
+  const fresh = resolveItem(current.cosmeticId)
+  if (fresh) {
+    detailItem.value = fresh
+    return
+  }
+  detailItem.value = null
+  detailOpen.value = false
 }
 
 /**
  * 去衣柜穿戴。
- *
- * 带上 cosmeticId 让衣柜能定位到这一件（衣柜只把它当提示，不强制穿戴），
- * 用户仍可在衣柜里自由改选 / 调缩放。
+ * 带上 cosmeticId 让衣柜能定位到这一件（只是提示，不强制穿戴）。
  */
-function goWardrobe(item?: CatalogItem): void {
+function goWardrobe(item?: StoreItem): void {
+  if (item && !resolveItem(item.cosmeticId)) {
+    warnStale()
+    return
+  }
   const query = item ? { cosmeticId: item.cosmeticId } : {}
   void router.push({ path: '/fashion/wardrobe', query })
 }
 
-/** 全局 ID 的 localId（`pack:local` → `local`；没有冒号时原样返回），与衣柜页同规则 */
-function localIdOf(cosmeticId: string): string {
-  const idx = cosmeticId.indexOf(':')
-  return idx > 0 && idx < cosmeticId.length - 1 ? cosmeticId.slice(idx + 1) : cosmeticId
-}
-
 /**
- * 这件时装是否已在衣柜里。
- *
- * 精确匹配优先；**目录是历史简单 ID** 时再按 localId 兜底（衣柜里可能存的是
- * 同一件时装的全局 ID）。两个不同的全局 ID（不同包同名 localId）不算同一件，
- * 避免串包误标「已在衣柜」。
+ * 免费时装「加入衣柜」（沿用原逻辑，调用 POST /wardrobe）。
+ * 不做乐观切换：失败只弹错误、卡片保持原样，后端幂等重复点也不会写坏数据。
  */
-function isInWardrobe(item: CatalogItem): boolean {
-  if (wardrobeIds.value.has(item.cosmeticId)) return true
-  if (item.cosmeticId.includes(':')) return false
-  return wardrobeLocalIds.value.has(item.cosmeticId)
-}
-
-/**
- * 加入衣柜。
- *
- * 这里**不做乐观切换**：一旦本地先把卡片切成「已在衣柜 ✓」，加入按钮就消失了，
- * 用户既看不到 loading 也无法在失败后立刻重试（回滚会让卡片闪一下）。
- * 用按钮 loading 挡住连点、成功后翻转卡片，失败只弹错误、卡片保持原样 ——
- * 交互最稳，且后端是幂等接口，重复点也不会写坏数据。
- */
-async function addToWardrobe(item: CatalogItem): Promise<void> {
-  const cosmeticId = item.cosmeticId
-  if (addingIds.value.has(cosmeticId)) return
-  addingIds.value = new Set(addingIds.value).add(cosmeticId)
+async function addToWardrobe(item: StoreItem): Promise<void> {
+  const current = resolveItem(item.cosmeticId)
+  if (!current) {
+    warnStale()
+    return
+  }
+  const cosmeticId = current.cosmeticId
+  if (actionBusyIds.value.has(cosmeticId)) return
+  actionBusyIds.value = new Set(actionBusyIds.value).add(cosmeticId)
   try {
     const { data } = await fashionApi.addToWardrobe(cosmeticId)
-    // 幂等：added=false 表示本来就在（例如另一个标签页刚加过）→ 同样切成「已在衣柜」
-    //
-    // 以**响应里的落库 ID** 为准：后端 `add_wardrobe_item` 会把历史简单 ID 就地升级成
-    // 目录的规范全局 ID（`canonical_loadout_cosmetic_id`），只认自己发出去的值会出现
-    // 「加了却还显示加入衣柜」（v1.3.0 审查 F2）。上报值不塞进 wardrobeIds —— 页头件数
-    // 用的是它的 size，混入别名会算多；简单 ID 的匹配交给 wardrobeLocalIds。
-    const storedId = (data.item && data.item.cosmeticId) || cosmeticId
-    wardrobeIds.value = new Set(wardrobeIds.value).add(storedId)
-    const storedLocal = localIdOf(storedId)
-    if (storedLocal !== storedId) {
-      wardrobeLocalIds.value = new Set(wardrobeLocalIds.value).add(storedLocal)
-    }
-    if (data.added) ElMessage.success(`已把「${displayName(item)}」加入衣柜`)
-    else ElMessage.info(`「${displayName(item)}」已经在你的衣柜里了`)
+    if (isUnmounted) return
+    // 幂等：added=false 表示本来就在（例如另一个标签页刚加过）
+    const idx = catalog.value.findIndex((row) => row.cosmeticId === cosmeticId)
+    if (idx >= 0) catalog.value[idx] = { ...catalog.value[idx], inWardrobe: true }
+    if (data.added) ElMessage.success(`已把「${displayName(current)}」加入衣柜`)
+    else ElMessage.info(`「${displayName(current)}」已经在你的衣柜里了`)
   } catch (error) {
+    // 付费未拥有时后端会返回 403 purchase_required，统一走中文提示（402/403/501 同理）
     notifyFashionError(error, '加入衣柜失败')
   } finally {
-    const rest = new Set(addingIds.value)
+    const rest = new Set(actionBusyIds.value)
     rest.delete(cosmeticId)
-    addingIds.value = rest
+    actionBusyIds.value = rest
+  }
+}
+
+function openPurchase(item: StoreItem): void {
+  const current = resolveItem(item.cosmeticId)
+  if (!current) {
+    warnStale()
+    return
+  }
+  purchaseItem.value = current
+  purchaseError.value = ''
+  purchaseOpen.value = true
+}
+
+function onPurchaseRecharge(): void {
+  purchaseOpen.value = false
+  rechargeOpen.value = true
+}
+
+/** 把购买结果同步回目录条目与共享余额（任务 A2：成功后更新余额 / owned / 衣柜集合） */
+function applyPurchaseResult(data: PurchaseResponse, item: StoreItem): void {
+  const fresh: StoreItem = data.item || {
+    ...item,
+    owned: true,
+    inWardrobe: true,
+    priceMango: data.priceMango || item.priceMango,
+  }
+  const idx = catalog.value.findIndex((row) => row.cosmeticId === item.cosmeticId)
+  if (idx >= 0) catalog.value.splice(idx, 1, fresh)
+  setMangoBalance(data.balance)
+  syncDetailWithCatalog()
+}
+
+async function doPurchase(clientRequestId: string): Promise<void> {
+  const item = purchaseItem.value
+  if (!item || purchasing.value) return
+  const current = resolveItem(item.cosmeticId)
+  if (!current) {
+    purchaseError.value = '这件时装已不在当前目录里，请关闭后刷新重试'
+    return
+  }
+  purchasing.value = true
+  purchaseError.value = ''
+  try {
+    const { data } = await fashionApi.purchase({
+      cosmeticId: current.cosmeticId,
+      clientRequestId,
+    })
+    if (isUnmounted) return
+    applyPurchaseResult(data, current)
+    purchaseOpen.value = false
+    purchaseItem.value = null
+    if (data.alreadyOwned) {
+      ElMessage.info(`「${displayName(current)}」你已经拥有了，已确保在衣柜里（不扣款）`)
+    } else if (data.free) {
+      ElMessage.success(`已免费领取「${displayName(current)}」并加入衣柜`)
+    } else {
+      ElMessage.success(
+        `购买成功！已扣除 🥭 ${data.priceMango}，剩余 🥭 ${data.balance}；已自动加入衣柜`
+      )
+    }
+  } catch (error) {
+    if (isUnmounted) return
+    // 402 余额不足 / 409 / 429 / 冲突：展示后端中文 message，弹窗内也保留一份
+    const message = fashionErrorMessage(error, '购买失败')
+    purchaseError.value = fashionErrorIsInsufficientMango(error)
+      ? `${message}。充值通道暂未开放，可点「去充值」查看说明，或联系管理员发放后再买。`
+      : message
+    notifyFashionError(error, '购买失败')
+  } finally {
+    purchasing.value = false
   }
 }
 
 /**
- * 读我的衣柜（只要 id 集合）。
- *
- * 失败不阻断商店浏览：目录照常可用，只是所有卡片都会显示「加入衣柜」——
- * 此时点击也是安全的（后端幂等），所以只提示、不把整页打成错误态。
+ * 已拥有但被移出衣柜：点「补回衣柜」走幂等 purchase（alreadyOwned=true 不扣款），
+ * 后端会确保该时装重新出现在衣柜里（契约 §4.2）。
  */
-async function loadWardrobe(): Promise<void> {
-  const seq = ++wardrobeSeq
-  loadingWardrobe.value = true
-  wardrobeError.value = false
+async function reAddToWardrobe(item: StoreItem): Promise<void> {
+  const current = resolveItem(item.cosmeticId)
+  if (!current) {
+    warnStale()
+    return
+  }
+  const cosmeticId = current.cosmeticId
+  if (actionBusyIds.value.has(cosmeticId)) return
+  actionBusyIds.value = new Set(actionBusyIds.value).add(cosmeticId)
   try {
-    const { data } = await fashionApi.wardrobe()
-    if (seq !== wardrobeSeq) return
-    // 精确 ID 与 localId 别名分开收集：前者用于「件数」，后者只用于匹配历史简单 ID
-    const ids = new Set<string>()
-    const localIds = new Set<string>()
-    for (const item of data.items || []) {
-      ids.add(item.cosmeticId)
-      const local = localIdOf(item.cosmeticId)
-      if (local !== item.cosmeticId) localIds.add(local)
-    }
-    wardrobeIds.value = ids
-    wardrobeLocalIds.value = localIds
+    const { data } = await fashionApi.purchase({ cosmeticId, clientRequestId: newRequestId() })
+    if (isUnmounted) return
+    applyPurchaseResult(data, current)
+    ElMessage.success(`已把「${displayName(current)}」补回衣柜（已拥有，不扣款）`)
   } catch (error) {
-    if (seq !== wardrobeSeq) return
-    wardrobeError.value = true
-    notifyFashionError(error, '读取我的衣柜失败')
+    notifyFashionError(error, '补回衣柜失败')
   } finally {
-    if (seq === wardrobeSeq) loadingWardrobe.value = false
+    const rest = new Set(actionBusyIds.value)
+    rest.delete(cosmeticId)
+    actionBusyIds.value = rest
   }
 }
 
-/** 目录 + 衣柜并行加载：挂载与「刷新」都走这里 */
-async function loadAll(): Promise<void> {
-  await Promise.all([loadCatalog(), loadWardrobe()])
+function openRecharge(): void {
+  rechargeOpen.value = true
 }
 
-async function loadCatalog(): Promise<void> {
-  const seq = ++catalogSeq
+function openDrawer(type: 'orders' | 'transactions'): void {
+  drawerType.value = type
+  drawerOpen.value = true
+}
+
+/** 商店页唯一的一次请求：目录 + 价格 + 拥有 / 衣柜状态 + 钱包 + 充值开关 */
+async function loadStore(): Promise<void> {
+  const seq = ++storeSeq
   loading.value = true
   loadError.value = false
   try {
-    const { data } = await fashionApi.catalog()
-    if (seq !== catalogSeq) return
+    const { data } = await fashionApi.storeItems()
+    if (isUnmounted || seq !== storeSeq) return
     catalog.value = data.items || []
-    // 目录重拉成功 = 资产可能已补齐，全部缩略图重试一次
-    brokenThumbs.value = new Set()
-    const maxPage = Math.max(1, Math.ceil(filteredCatalog.value.length / pageSize))
+    applyStoreWallet(data.wallet, data.rechargeAvailable)
+    // 目录重拉成功 = 资产可能已补齐，全部缩略图重试一次（P2-1）
+    brokenThumbUrls.value = new Set()
+    const maxPage = Math.max(1, Math.ceil(filteredCatalog.value.length / pageSize.value))
     if (page.value > maxPage) page.value = maxPage
+    syncDetailWithCatalog()
   } catch (error) {
-    if (seq !== catalogSeq) return
+    if (isUnmounted || seq !== storeSeq) return
     loadError.value = true
-    notifyFashionError(error, '读取时装目录失败')
+    notifyFashionError(error, '读取时装商店失败')
   } finally {
-    if (seq === catalogSeq) loading.value = false
+    if (!isUnmounted && seq === storeSeq) loading.value = false
   }
 }
 
+/** 挂载与「刷新」都走这里（原先并行读 catalog + wardrobe，现在一次拿全） */
+async function loadAll(): Promise<void> {
+  await loadStore()
+}
+
 onMounted(loadAll)
+
+onUnmounted(() => {
+  // P3：路由切走后不再写状态、不再弹 toast
+  isUnmounted = true
+  ++storeSeq
+})
 </script>
 
 <style scoped>
@@ -497,6 +702,8 @@ onMounted(loadAll)
   color: var(--text-secondary);
   font-size: 13px;
   margin: 0;
+  max-width: 720px;
+  line-height: 1.7;
 }
 
 .head-actions {
@@ -567,11 +774,14 @@ onMounted(loadAll)
   background: var(--bg-elevated);
   padding: var(--space-2);
   transition: border-color 150ms var(--ease-out), transform 150ms var(--ease-out);
+  min-width: 0;
 }
 
-.store-item:hover {
-  border-color: var(--accent-active);
-  transform: translateY(-2px);
+@media (hover: hover) {
+  .store-item:hover {
+    border-color: var(--accent-active);
+    transform: translateY(-2px);
+  }
 }
 
 .item-thumb {
@@ -586,6 +796,7 @@ onMounted(loadAll)
   margin-bottom: var(--space-2);
   cursor: pointer;
   padding: 0;
+  touch-action: manipulation;
 }
 
 .item-thumb:focus-visible {
@@ -610,6 +821,7 @@ onMounted(loadAll)
   flex-direction: column;
   gap: 4px;
   flex: 1;
+  min-width: 0;
 }
 
 .item-name {
@@ -628,6 +840,7 @@ onMounted(loadAll)
   font-size: 11px;
   color: var(--text-secondary);
   min-height: 18px;
+  flex-wrap: wrap;
 }
 
 .slot-tag {
@@ -645,6 +858,22 @@ onMounted(loadAll)
   color: var(--text-muted);
 }
 
+.price-tag {
+  margin-left: auto;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.price-tag.price-free {
+  background: var(--success-bg);
+  color: var(--success);
+  font-weight: 500;
+}
+
 .item-actions {
   display: flex;
   align-items: center;
@@ -652,53 +881,18 @@ onMounted(loadAll)
   gap: 4px;
   margin-top: auto;
   padding-top: 2px;
-  /* 「已在衣柜 ✓」+「去穿戴 →」两个元素在窄卡片里必须能换行，否则会被压成省略号 */
   flex-wrap: wrap;
+  min-width: 0;
 }
 
-/* 卡片右侧动作组：状态标签 + 文字按钮，右对齐 */
-.action-right {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  margin-left: auto;
-}
-
-/* 「已在衣柜 ✓」状态标签：用语义色而不是强调橙，和可点击的橙色动作区分开 */
-.ward-tag {
-  font-size: 11px;
-  line-height: 18px;
-  white-space: nowrap;
-  color: var(--success);
-  background: var(--success-bg);
-  border-radius: 999px;
-  padding: 0 8px;
-}
-
-.dialog-ward-tag {
-  margin: 0 var(--space-2);
-  vertical-align: middle;
-}
-
-/* 卡片内两个动作都走文字按钮：12 张卡各一个实心主按钮会把整页压成一片橙色，
-   与主站「卡片只给一处强调」的克制风格不符 */
 .detail-btn {
   color: var(--text-secondary);
 }
 
-.detail-btn:hover {
-  color: var(--text-primary);
-}
-
-.equip-btn {
-  padding: 0 4px;
-  /* global.css 用 !important 把 el-button--primary 的文字统一压成深色，
-     这里要「文字链接」观感，必须同等优先级地改回强调色 */
-  color: var(--accent) !important;
-}
-
-.equip-btn:hover {
-  color: var(--accent-hover) !important;
+@media (hover: hover) {
+  .detail-btn:hover {
+    color: var(--text-primary);
+  }
 }
 
 .store-pager {
@@ -727,6 +921,7 @@ onMounted(loadAll)
 .detail-image {
   max-width: 100%;
   max-height: 100%;
+  cursor: zoom-in;
 }
 
 .detail-fallback {
@@ -735,14 +930,58 @@ onMounted(loadAll)
   color: var(--text-secondary);
 }
 
+.detail-placeholder,
+.detail-image-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 100%;
+  min-height: 120px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.loading-spinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--border-subtle);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: fashion-spin 0.8s linear infinite;
+}
+
+@keyframes fashion-spin {
+  to { transform: rotate(360deg); }
+}
+
+.zoom-hint {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
 .detail-hint {
   font-size: 12px;
   color: var(--text-secondary);
   margin: 0;
+  line-height: 1.7;
 }
 
 .detail-meta {
   margin-top: var(--space-2);
+}
+
+.detail-price {
+  color: var(--accent);
+  font-weight: 600;
+}
+
+.detail-price-free {
+  color: var(--success);
 }
 
 @media (max-width: 768px) {
@@ -765,10 +1004,21 @@ onMounted(loadAll)
   .item-thumb {
     height: 88px;
   }
+
+  /* 弹窗内大图在窄屏 / 横屏收缩，别把整个弹窗占满 */
+  .detail-preview {
+    height: min(200px, 32dvh);
+  }
+}
+
+@media (max-height: 480px) {
+  .detail-preview {
+    height: 120px;
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
   .store-item { transition: none; }
-  .store-item:hover { transform: none; }
+  .loading-spinner { animation: none; }
 }
 </style>

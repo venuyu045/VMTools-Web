@@ -213,6 +213,37 @@ def _run_lightweight_migrations(engine) -> None:
             except Exception as _e:
                 logger.warning("Role migration check: {}", _e)
             if _DATABASE_URL and _DATABASE_URL.startswith("sqlite"):
+                # ── 时装：芒果块定价列（v1.1）放在本块**最前面** ──────────
+                # 正式迁移是 alembic 20261105_fashion_mango；这里是「开发机直接跑
+                # init_db() 的 create_all、没跑 alembic」的兜底。create_all(checkfirst)
+                # **只建缺失的表，不给已存在的表加列**（2026-11-01 事故 §六.106 同款
+                # 教训），缺列会让所有时装目录查询直接 OperationalError。
+                # ⚠️ 必须放在本块最前：下面任何一条 ALTER 若因「表不存在」抛异常，
+                # 会被最外层 except 接住并跳过后续所有迁移；定价列是时装页的硬性
+                # 前置，不能排在其它表的迁移后面。
+                # ⚠️ 也必须留在这个 sqlite 判断块内：PRAGMA 是 SQLite 专用语法，
+                # 放到块外会在 PostgreSQL 上报语法错误，把整个事务拖进 aborted 状态。
+                try:
+                    f_columns = {
+                        row[1]
+                        for row in conn.execute(
+                            text("PRAGMA table_info(fashion_catalog)")
+                        ).fetchall()
+                    }
+                    if f_columns:  # 空集合 = 表还不存在，交给 create_all 建（自带新列）
+                        if "price_mango" not in f_columns:
+                            conn.execute(text(
+                                "ALTER TABLE fashion_catalog "
+                                "ADD COLUMN price_mango INTEGER NOT NULL DEFAULT 0"
+                            ))
+                        if "purchasable" not in f_columns:
+                            conn.execute(text(
+                                "ALTER TABLE fashion_catalog "
+                                "ADD COLUMN purchasable BOOLEAN NOT NULL DEFAULT 1"
+                            ))
+                except Exception as _e:
+                    logger.warning("fashion mango columns migration check: {}", _e)
+
                 columns = {row[1] for row in conn.execute(text("PRAGMA table_info(mcc_instances)")).fetchall()}
                 if "account_profile_id" not in columns:
                     conn.execute(text("ALTER TABLE mcc_instances ADD COLUMN account_profile_id VARCHAR"))
@@ -287,6 +318,7 @@ def _run_lightweight_migrations(engine) -> None:
                         conn.execute(text("ALTER TABLE map_art_tasks ADD COLUMN sleep_z INTEGER"))
                 except Exception as _e:
                     logger.warning("map_art_tasks sleep migration check: {}", _e)
+
             # 定时任务：自动上线/下线开关（2026-08-13）
             try:
                 s_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(scheduled_tasks)")).fetchall()}

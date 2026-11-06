@@ -48,6 +48,13 @@ export interface CatalogItem {
   bytes: number
   packId: string
   sortOrder: number
+  /**
+   * 芒果块定价（v1.1）。**可选**：`GET /catalog` 是 mod 契约、带全站缓存，
+   * 不返回这两个用户态字段；商店页改用 `GET /store/items`（见 StoreItem）。
+   * 这里标可选只是为了兼容老调用点，不要在 /catalog 的数据上依赖它们。
+   */
+  priceMango?: number
+  purchasable?: boolean
 }
 
 /**
@@ -132,6 +139,10 @@ export interface AdminCatalogItem {
   bytes: number
   enabled: boolean
   sortOrder: number
+  /** 价格（芒果块），0 = 免费；范围 0..1_000_000（v1.1） */
+  priceMango: number
+  /** false = 商店不售卖（仅管理端发放），仍可穿戴（v1.1） */
+  purchasable: boolean
 }
 
 /**
@@ -148,6 +159,10 @@ export interface CatalogUpsertPayload {
   bytes?: number | null
   enabled?: boolean
   sortOrder?: number
+  /** 芒果块定价：`POST/PUT /admin/catalog` 支持部分更新，只传这一个也能改价（v1.1） */
+  priceMango?: number
+  /** 是否可购买（商店是否售卖）；不传 = 不改（v1.1） */
+  purchasable?: boolean
 }
 
 /** 已上传资产（`GET /admin/assets`） */
@@ -194,6 +209,198 @@ export interface PackUploadResult {
   pack: FashionPack
 }
 
+// ── 芒果块钱包 / 代币购买（v1.1；契约见 docs/fashion-mango-wallet-api.md）──────
+// 所有字段 camelCase，与后端 schemas/fashion.py 的 alias 一致。货币统一叫「芒果块」。
+
+/** 我的钱包（GET /wallet、GET /store/items 内联返回） */
+export interface WalletOut {
+  balance: number
+  currency: string
+  totalEarned: number
+  totalSpent: number
+  updatedAt: string | null
+}
+
+/** 一条收支流水（GET /wallet/transactions）；delta 正入负出，按 createdAt 倒序 */
+export interface WalletTransactionItem {
+  id: string
+  /** purchase | refund | admin_adjust | recharge | grant */
+  type: string
+  delta: number
+  balanceAfter: number
+  amountAbs: number
+  cosmeticId: string
+  cosmeticName: string
+  note: string
+  createdAt: string | null
+}
+
+export interface WalletTransactionListResponse {
+  items: WalletTransactionItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
+/** 充值渠道（本期恒为空数组；接入支付后由后端填充） */
+export interface RechargeChannel {
+  id: string
+  name: string
+  description: string
+  enabled: boolean
+}
+
+/** GET /wallet/recharge/options：充值入口全部展示信息（本期 available=false） */
+export interface RechargeOptionsResponse {
+  available: boolean
+  currency: string
+  channels: RechargeChannel[]
+  notice: string
+}
+
+/** POST /wallet/recharge 请求（本期固定返回 501，形状先定死） */
+export interface RechargePayload {
+  amount: number
+  channel?: string
+  clientRequestId?: string
+}
+
+/** 充值成功响应（本期不会返回，供后续接入支付时复用） */
+export interface RechargeResponse {
+  ok: boolean
+  balance: number
+  transactionId: string
+  orderNo: string
+}
+
+/** 商店条目：目录元数据 + 定价 + 当前用户的拥有/衣柜状态（GET /store/items） */
+export interface StoreItem {
+  cosmeticId: string
+  name: string
+  category: string
+  assetKey: string
+  sha256: string
+  bytes: number
+  packId: string
+  sortOrder: number
+  /** 价格（芒果块），0 = 免费 */
+  priceMango: number
+  /** false = 商店不售卖（仅管理端发放），仍可穿戴 */
+  purchasable: boolean
+  owned: boolean
+  inWardrobe: boolean
+}
+
+/** GET /store/items 聚合响应：一次拿全余额 / 价格 / 拥有 / 衣柜状态 / 充值开关 */
+export interface StoreItemsResponse {
+  currency: string
+  wallet: WalletOut
+  rechargeAvailable: boolean
+  items: StoreItem[]
+}
+
+/** POST /store/purchase 请求 */
+export interface PurchasePayload {
+  cosmeticId: string
+  /** 可选幂等键（<=64 字符）：网络重试 / 双击不会重复扣款 */
+  clientRequestId?: string
+}
+
+/** POST /store/purchase 响应（幂等：alreadyOwned=true 表示之前已拥有，不扣款） */
+export interface PurchaseResponse {
+  ok: boolean
+  purchased: boolean
+  alreadyOwned: boolean
+  free: boolean
+  priceMango: number
+  balance: number
+  cosmeticId: string
+  item: StoreItem | null
+  transactionId: string
+}
+
+/** 购买/获得记录条目（GET /store/orders，所有权维度，删衣柜不会消失） */
+export interface PurchaseOrderItem {
+  orderNo: string
+  cosmeticId: string
+  name: string
+  category: string
+  packId: string
+  pricePaid: number
+  /** purchase | free_claim | legacy_wardrobe | admin_grant | migration */
+  source: string
+  note: string
+  acquiredAt: string | null
+  /** 目录已删除 / 已停用 */
+  missing: boolean
+}
+
+export interface PurchaseOrderListResponse {
+  items: PurchaseOrderItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
+/** 分页参数（limit 1..100，默认 20；offset >= 0） */
+export interface FashionListParams {
+  limit?: number
+  offset?: number
+}
+
+/** POST /admin/wallet/adjust 请求：delta > 0 发放、< 0 扣回，不能为 0 */
+export interface AdminWalletAdjustPayload {
+  userId: string
+  delta: number
+  note?: string
+}
+
+export interface AdminWalletAdjustResponse {
+  ok: boolean
+  userId: string
+  balance: number
+  delta: number
+  transactionId: string
+}
+
+/** 管理端用户钱包条目（GET /admin/wallet/users） */
+export interface AdminWalletUser {
+  userId: string
+  gameId: string
+  displayName: string
+  role: string
+  balance: number
+  totalEarned: number
+  totalSpent: number
+}
+
+export interface AdminWalletUserListResponse {
+  items: AdminWalletUser[]
+  total: number
+  limit: number
+  offset: number
+}
+
+export interface AdminWalletUsersParams extends FashionListParams {
+  keyword?: string
+}
+
+/** POST /admin/wallet/grant-cosmetic：直接发放一件时装（不扣币，自动加入衣柜） */
+export interface AdminGrantCosmeticPayload {
+  userId: string
+  cosmeticId: string
+  note?: string
+}
+
+export interface AdminGrantCosmeticResponse {
+  ok: boolean
+  userId: string
+  cosmeticId: string
+  /** false = 该用户之前已拥有（幂等，不重复写入） */
+  granted: boolean
+  item: StoreItem | null
+}
+
 export type UploadProgressHandler = (e: { loaded: number; total: number }) => void
 
 /**
@@ -227,10 +434,48 @@ function uploadConfig(
 }
 
 export const fashionApi = {
-  /** 时装目录（登录用户可读） */
+  /** 时装目录（登录用户可读；mod 契约，带缓存，**不含**用户态价格/拥有字段） */
   catalog(params?: { category?: string; pack_id?: string }) {
     return client.get<{ items: CatalogItem[] }>('/fashion/catalog', { params })
   },
+
+  // ── 芒果块钱包 / 商店购买（v1.1；契约见 docs/fashion-mango-wallet-api.md §3）──
+
+  /**
+   * 商店页聚合数据：目录 + 定价 + 拥有/衣柜状态 + 钱包余额 + 充值开关，**一次拿全**。
+   * 与 `catalog()` 的区别：它按当前登录用户计算 owned/inWardrobe，不能复用全站缓存。
+   */
+  storeItems(params?: { category?: string; pack_id?: string }) {
+    return client.get<StoreItemsResponse>('/fashion/store/items', { params })
+  },
+  /** 用芒果块购买 / 免费领取一件时装（成功自动加入衣柜；幂等） */
+  purchase(payload: PurchasePayload) {
+    return client.post<PurchaseResponse>('/fashion/store/purchase', payload)
+  },
+  /** 我的购买/获得记录（所有权维度，删衣柜不会消失） */
+  orders(params?: FashionListParams) {
+    return client.get<PurchaseOrderListResponse>('/fashion/store/orders', { params })
+  },
+  /** 我的钱包（首次访问自动创建余额 0 的钱包） */
+  wallet() {
+    return client.get<WalletOut>('/fashion/wallet')
+  },
+  /** 芒果块收支明细（按时间倒序，分页） */
+  walletTransactions(params?: FashionListParams) {
+    return client.get<WalletTransactionListResponse>('/fashion/wallet/transactions', { params })
+  },
+  /** 充值入口信息（本期恒 available=false、channels=[]） */
+  rechargeOptions() {
+    return client.get<RechargeOptionsResponse>('/fashion/wallet/recharge/options')
+  },
+  /**
+   * 充值占位：本期后端固定 501 `recharge_not_available`，接口形状先定死。
+   * 调用方必须**友好处理 501**（ElMessage.info + 弹窗内说明），不要当崩溃弹红条。
+   */
+  recharge(payload: RechargePayload) {
+    return client.post<RechargeResponse>('/fashion/wallet/recharge', payload)
+  },
+
   // ── 我的衣柜（收藏制：只有主动「加入衣柜」的时装才在这里）───────────────
   /**
    * 我的衣柜。
@@ -288,15 +533,46 @@ export const fashionApi = {
       { params: identityId ? { identityId } : {} }
     )
   },
-  /** 资产 URL（公开可读、长缓存；注意带 /api 前缀，img 标签直接可用） */
-  assetUrl(assetKey: string) {
+  /**
+   * 资产 URL（公开可读、带 immutable 长缓存；带 /api 前缀，img 标签直接可用）。
+   *
+   * P2-3：后端对资产回 `Cache-Control: public,max-age=31536000,immutable`，
+   * 只用 assetKey 拼 URL 时管理员替换资产（sha256 变了）用户一年都看到旧图。
+   * 追加 `?v=${sha256.slice(0,12)}` 作版本戳即可破缓存；后端 `{asset_key:path}`
+   * 路由按路径取文件、忽略 query，安全。**第二参数可选**：老调用点不传也能用，
+   * 但缩略图/大图/viewer 应尽量把当前条目的 sha256 传进来。
+   *
+   * P3 防御：
+   * - 空 assetKey（或全是 "."/".."）返回 ''，调用方据此不渲染 img（避免必然 404）；
+   * - 反斜杠归一为 '/'，避免 Windows 路径拼出畸形 URL；
+   * - 含字面 '%' 的段先 decodeURIComponent 再重新编码，避免 `%20 → %2520` 二次编码。
+   */
+  assetUrl(assetKey: string, sha256?: string): string {
+    if (!assetKey) return ''
     const safe = assetKey
+      .replace(/\\/g, '/')
       .split('/')
       // 丢弃空段与 "."/".."：避免拼出会被浏览器归一化的穿越路径
       .filter((seg) => seg && seg !== '.' && seg !== '..')
-      .map((seg) => encodeURIComponent(seg))
+      .map((seg) => {
+        let raw = seg
+        // 段里已经有百分号转义（如历史 assetKey "icon%20a.png"）时先解码，
+        // 否则 encodeURIComponent 会把 '%' 再编一次变成 '%25'
+        if (raw.includes('%')) {
+          try {
+            raw = decodeURIComponent(raw)
+          } catch {
+            // 非法百分号序列（如 "100%.png"）：保持原样，下面统一编码成 %25
+          }
+        }
+        return encodeURIComponent(raw)
+      })
       .join('/')
-    return `/api/fashion/assets/${safe}`
+    if (!safe) return ''
+    const url = `/api/fashion/assets/${safe}`
+    // sha256 通常已是十六进制；仍走 encodeURIComponent 防注入
+    const version = (sha256 || '').trim().slice(0, 12)
+    return version ? `${url}?v=${encodeURIComponent(version)}` : url
   },
 
   // ── 管理端（仅 site_admin；后端是 require_site_admin，admin 调会 403）──
@@ -322,6 +598,24 @@ export const fashionApi = {
       `/fashion/admin/catalog/${encodeURIComponent(cosmeticId)}`
     )
   },
+
+  // ── 管理端：芒果块钱包（site_admin；v1.1）──────────────────────────────
+  /** 发放 / 扣回芒果块（充值开放前唯一入金途径；delta 不能为 0） */
+  adminAdjustWallet(payload: AdminWalletAdjustPayload) {
+    return client.post<AdminWalletAdjustResponse>('/fashion/admin/wallet/adjust', payload)
+  },
+  /** 用户钱包列表（按 gameId / displayName 模糊搜索） */
+  adminWalletUsers(params?: AdminWalletUsersParams) {
+    return client.get<AdminWalletUserListResponse>('/fashion/admin/wallet/users', { params })
+  },
+  /** 直接给用户发放一件时装（不扣币，自动加入衣柜；补发 / 活动赠送 / 联调） */
+  adminGrantCosmetic(payload: AdminGrantCosmeticPayload) {
+    return client.post<AdminGrantCosmeticResponse>(
+      '/fashion/admin/wallet/grant-cosmetic',
+      payload
+    )
+  },
+
   /** 资产列表（可按 packId 过滤） */
   adminAssets(params?: { pack_id?: string }) {
     return client.get<{ items: FashionAsset[] }>('/fashion/admin/assets', { params })
@@ -483,10 +777,34 @@ export function isSilentFashionError(error: unknown): boolean {
 }
 
 /**
+ * 402 余额不足：购买失败时用它给出「去充值 / 联系管理员发放」的引导。
+ * 后端 `insufficient_mango` 的 message 里带还差多少，`notifyFashionError` 会原样展示。
+ */
+export function fashionErrorIsInsufficientMango(error: unknown): boolean {
+  return fashionErrorCode(error) === 'insufficient_mango' || fashionErrorStatus(error) === 402
+}
+
+/**
+ * 「充值通道未开放」的 501（预留接口本期固定返回）：
+ * 这是**预期内**的占位响应，不是服务端崩溃，调用方应弹 info 级友好提示，
+ * 不要走 `notifyFashionError` 弹红条、也不要落到「服务器内部错误（5xx）」兜底。
+ */
+export function fashionErrorIsRechargeUnavailable(error: unknown): boolean {
+  return (
+    fashionErrorCode(error) === 'recharge_not_available' ||
+    fashionErrorStatus(error) === 501
+  )
+}
+
+/**
  * 时装页统一错误提示（替代到处写的 `ElMessage.error(fashionErrorMessage(...))`）。
  *
  * 与直接调 `ElMessage.error` 的区别只有一处：跳过 401 / 主动取消这两类
  * 「已有别的反馈」的错误（见 {@link isSilentFashionError}）。
+ *
+ * 说明：402 余额不足 / 403 purchase_required / 501 充值未开放 都走
+ * `fashionErrorMessage`，它会优先取后端结构化的中文 `detail.message` 展示；
+ * 501 由调用方用 {@link fashionErrorIsRechargeUnavailable} 单独做友好提示。
  */
 export function notifyFashionError(error: unknown, fallback = '操作失败'): void {
   if (isSilentFashionError(error)) return

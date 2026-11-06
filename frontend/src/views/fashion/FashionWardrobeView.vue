@@ -173,14 +173,9 @@
                   missing: item.missing,
                   'batch-mode': batchMode,
                 }"
-                role="button"
-                tabindex="0"
-                :aria-pressed="batchMode ? isSelected(item) : isEquipped(item)"
-                :aria-disabled="!batchMode && item.missing ? 'true' : undefined"
+                role="group"
                 :aria-label="cardAriaLabel(item)"
                 @click="onCardActivate(item)"
-                @keydown.enter.prevent="onCardActivate(item)"
-                @keydown.space.prevent="onCardActivate(item)"
               >
                 <!-- 批量管理：勾选框只是「选中的视觉」，真正的勾选逻辑在卡片点击上，
                      这样键盘（Enter/Space）和触屏都能操作，不必精确点中小方块 -->
@@ -206,13 +201,21 @@
                   ✕
                 </button>
                 <div class="cosmetic-thumb">
+                  <!--
+                    P2-4：已下架（missing）条目的资产必然 404（后端 resolve_asset_file
+                    对停用行返回 None），不渲染 img，直接给「已下架」占位。
+                    P2-1：破图按失败的 URL 记录，旧请求 error 不会误杀新预览。
+                    P1-2：低优先级 + 懒加载 + 异步解码，移动端少解码全尺寸大图。
+                  -->
+                  <span v-if="item.missing" class="thumb-fallback missing-fallback">已下架</span>
                   <img
-                    v-if="previewUrls.has(item.cosmeticId) && !brokenThumbs.has(item.cosmeticId)"
-                    :src="previewUrls.get(item.cosmeticId) || ''"
+                    v-else-if="thumbUrl(item) && !brokenThumbUrls.has(thumbUrl(item))"
+                    :src="thumbUrl(item)"
                     :alt="displayName(item)"
                     loading="lazy"
+                    fetchpriority="low"
                     decoding="async"
-                    @error="markThumbBroken(item.cosmeticId)"
+                    @error="markThumbBroken"
                   />
                   <span v-else class="thumb-fallback">{{ (displayName(item) || '?').slice(0, 1) }}</span>
                 </div>
@@ -367,35 +370,58 @@
       </el-card>
     </div>
 
-    <!-- 详情弹窗（B3）：点卡片是「立即穿戴」，这里给一个先看大图/元信息的中间态 -->
+    <!-- 详情弹窗（B3 / P2-7）：点卡片 = 打开详情，穿戴放到弹窗里二次确认 -->
     <el-dialog
       v-model="detailOpen"
       :title="detailItem ? displayName(detailItem) : '时装详情'"
-      width="520px"
+      width="min(520px, 92vw)"
       class="detail-dialog"
+      destroy-on-close
+      @open="onDetailOpen"
+      @closed="onDetailClosed"
     >
       <div v-if="detailItem" class="detail-body">
-        <!-- el-image 没有 alt prop（`:alt` 只会落到根 div 上），读屏拿不到名称：
-             由容器给 role=img + aria-label，替大图提供可读的替代文本 -->
+        <!-- 只在真的有预览图（且未下架）时给容器 role=img / aria-label（P3） -->
         <div
           class="detail-preview"
-          :role="detailUrl ? 'img' : undefined"
-          :aria-label="detailUrl ? `${displayName(detailItem)} 预览图` : undefined"
+          :role="detailUrl && !detailItem.missing ? 'img' : undefined"
+          :aria-label="detailUrl && !detailItem.missing ? `${displayName(detailItem)} 预览图` : undefined"
         >
           <el-image
-            v-if="detailUrl"
+            v-if="detailUrl && !detailItem.missing"
+            :key="detailUrl"
             :src="detailUrl"
             :preview-src-list="[detailUrl]"
             preview-teleported
+            hide-on-click-modal
             fit="contain"
             class="detail-image"
             :alt="displayName(detailItem)"
-          />
+            @show="onViewerShow"
+            @close="onViewerClose"
+            @error="onDetailImageError"
+            @load="onDetailImageLoad"
+          >
+            <template #placeholder>
+              <div class="detail-placeholder">
+                <span class="loading-spinner" aria-hidden="true"></span>
+                <span>预览加载中…</span>
+              </div>
+            </template>
+            <template #error>
+              <div class="detail-image-error">
+                <span>预览加载失败</span>
+                <el-button size="small" type="primary" @click.stop="retryDetail">重试</el-button>
+              </div>
+            </template>
+          </el-image>
+          <span v-else-if="detailItem.missing" class="detail-fallback missing-fallback">已下架</span>
           <span v-else class="detail-fallback">{{ (displayName(detailItem) || '?').slice(0, 1) }}</span>
         </div>
-        <p v-if="!detailUrl" class="detail-hint mono">
-          {{ detailItem.assetKey ? '该资产不是图片格式，网页无法预览。' : '这件时装还没有上传资产（assetKey 为空）。' }}
+        <p v-if="detailUrl && !detailItem.missing" class="zoom-hint mono">
+          点击图片查看大图（可双指缩放 / 点空白处关闭）
         </p>
+        <p v-if="detailHint" class="detail-hint mono">{{ detailHint }}</p>
         <el-descriptions :column="1" border size="small" class="detail-meta">
           <el-descriptions-item label="ID">
             <span class="mono">{{ detailItem.cosmeticId }}</span>
@@ -445,9 +471,19 @@ import {
   type WardrobeItem,
 } from '@/api/fashion'
 import { fmtApiTime } from '@/utils/time'
+import { useResponsivePageSize } from '@/composables/useResponsivePageSize'
+import { useScrollLock } from '@/composables/useScrollLock'
+import { useFashionImageViewer } from '@/composables/useFashionImageViewer'
 
 const route = useRoute()
 const router = useRouter()
+
+// P2-6：详情弹窗 / 全屏大图打开时锁住 .app-main（真正的滚动容器）
+const { lock, unlock } = useScrollLock()
+// P1-1 + P2-9：viewer 的返回键 / 横竖屏重置 / 滚动锁
+const { onShow: onViewerShow, onClose: onViewerClose } = useFashionImageViewer()
+// P3：路由切走后网络回来不再写状态、不弹提示
+let isUnmounted = false
 
 // 缩放区间：与后端 core/fashion_service.py:54-55 的 0.25 / 4.0 对齐
 const MIN_SCALE = 0.25
@@ -461,17 +497,20 @@ const activeIdentityId = ref('')
 // 「衣柜里还是全时装都在」，所以现在只渲染玩家主动加入的收藏。
 const wardrobe = ref<WardrobeItem[]>([])
 // 预览图加载失败（条目填了 assetKey 但资产还没上传 / 文件被删）的时装：
-// 退回首字占位，避免整面衣柜都是破图图标
-const brokenThumbs = ref<Set<string>>(new Set())
+// P2-1 改成按**失败的 URL**记录，避免旧请求的 error 误杀换了 assetKey/sha256 的新预览
+const brokenThumbUrls = ref<Set<string>>(new Set())
 const activeCategory = ref('all')
 // B1：衣柜件数多了只能靠肉眼扫 → 加搜索（名称 / ID，大小写不敏感）
 const searchKeyword = ref('')
-// B2：一次渲染全部卡片（每张卡还要跑 4 次 isEquipped）→ 分页，一页 60 张
+// B2 / P1-2：一次渲染全部卡片（每张卡还要跑 4 次 isEquipped）→ 分页；
+// 移动端一页少渲染一些全尺寸大图（后端本期无缩略图端点），避免解码 OOM
 const wardrobePage = ref(1)
-const pageSize = 60
+const pageSize = useResponsivePageSize(60, 16)
 // B3：详情弹窗（大图 + 元信息）
 const detailOpen = ref(false)
 const detailItem = ref<WardrobeItem | null>(null)
+const detailRetrySeq = ref(0)
+const detailImageError = ref(false)
 const selection = ref<Record<string, { cosmeticId: string; scale: number }>>({})
 const missingSlots = ref<Set<string>>(new Set())
 const savedSnapshot = ref('{}')
@@ -626,13 +665,18 @@ const filteredWardrobe = computed(() => {
 })
 
 const pagedWardrobe = computed(() => {
-  const start = (wardrobePage.value - 1) * pageSize
-  return filteredWardrobe.value.slice(start, start + pageSize)
+  const start = (wardrobePage.value - 1) * pageSize.value
+  return filteredWardrobe.value.slice(start, start + pageSize.value)
 })
 
 // 搜索 / 切分类后回到第一页，否则可能停在一个空页上
 watch([searchKeyword, activeCategory], () => {
   wardrobePage.value = 1
+})
+// P1-2：视口变化让 pageSize 改变时把页码夹回有效范围
+watch(pageSize, () => {
+  const maxPage = Math.max(1, Math.ceil(filteredWardrobe.value.length / pageSize.value))
+  if (wardrobePage.value > maxPage) wardrobePage.value = maxPage
 })
 
 /** 缩放夹紧（B9）：后端两条写路径都会夹，但载入时也夹一次，避免「值 99 / 滑块卡在 4」 */
@@ -643,15 +687,21 @@ function clampScale(value: unknown): number {
 }
 
 // 预览图地址只算一次，模板里用 Map 取值（避免 v-if 与 :src 各自重复计算）
+// P2-3：URL 带 sha256 版本戳，管理员替换资产后不会被 immutable 缓存卡一年
 const previewUrls = computed(() => {
   const map = new Map<string, string>()
   for (const item of wardrobe.value) {
     if (!item.assetKey) continue
     if (!/\.(png|jpe?g|webp|gif)$/i.test(item.assetKey)) continue
-    map.set(item.cosmeticId, fashionApi.assetUrl(item.assetKey))
+    const url = fashionApi.assetUrl(item.assetKey, item.sha256)
+    if (url) map.set(item.cosmeticId, url)
   }
   return map
 })
+
+function thumbUrl(item: WardrobeItem): string {
+  return previewUrls.value.get(item.cosmeticId) || ''
+}
 
 /** 有收藏但筛不出来时的空态文案（真正的空衣柜有单独的引导，不共用这里） */
 const emptyFilterText = computed(() => {
@@ -689,11 +739,39 @@ const saveDisabled = computed(
 )
 
 // ── 详情弹窗 ──
+/** 详情大图 URL；重试时追加时间戳强制重新请求（P2-2） */
 const detailUrl = computed(() => {
   const item = detailItem.value
   if (!item) return ''
-  return previewUrls.value.get(item.cosmeticId) || ''
+  const base = previewUrls.value.get(item.cosmeticId) || ''
+  if (!base) return ''
+  if (detailRetrySeq.value <= 0) return base
+  return `${base}${base.includes('?') ? '&' : '?'}t=${detailRetrySeq.value}`
 })
+
+/** 区分「已下架」「没有资产」「不是图片格式」「图片加载失败」，文案不再张冠李戴 */
+const detailHint = computed(() => {
+  const item = detailItem.value
+  if (!item) return ''
+  if (item.missing) return '这件时装已从站点目录移除（已下架），无法预览 / 穿戴，但仍可从衣柜移除。'
+  if (!item.assetKey) return '这件时装还没有上传资产（assetKey 为空）。'
+  if (!/\.(png|jpe?g|webp|gif)$/i.test(item.assetKey)) {
+    return '该资产不是图片格式（glb / json / zip 等），网页无法预览。'
+  }
+  if (detailImageError.value) return '预览图加载失败，可点上方「重试」重新加载；若持续失败请联系管理员检查资产文件。'
+  return ''
+})
+
+function onDetailImageError(): void {
+  detailImageError.value = true
+}
+function onDetailImageLoad(): void {
+  detailImageError.value = false
+}
+function retryDetail(): void {
+  detailImageError.value = false
+  detailRetrySeq.value = Date.now()
+}
 
 const detailSlotLabel = computed(() => {
   const item = detailItem.value
@@ -712,12 +790,32 @@ const detailEquipLabel = computed(() => {
   const item = detailItem.value
   if (!item) return '穿戴'
   if (item.missing) return '已下架，不可穿戴'
+  if (isEquipped(item)) return '已穿戴'
   return `穿戴到${detailSlotLabel.value}`
 })
 
 function openDetail(item: WardrobeItem): void {
+  // P2-12：操作前校验条目仍在当前衣柜数据里，避免对过期引用开弹窗
+  if (!wardrobe.value.some((row) => row.cosmeticId === item.cosmeticId)) {
+    ElMessage.warning('这件时装已不在衣柜里，请刷新后再试')
+    return
+  }
+  detailRetrySeq.value = 0
+  detailImageError.value = false
   detailItem.value = item
   detailOpen.value = true
+}
+
+function onDetailOpen(): void {
+  lock('wardrobe-detail')
+}
+
+function onDetailClosed(): void {
+  unlock('wardrobe-detail')
+  // P2-12 / P3：关闭后清掉引用与加载态，避免对着过期条目操作
+  detailItem.value = null
+  detailRetrySeq.value = 0
+  detailImageError.value = false
 }
 
 /**
@@ -741,6 +839,12 @@ function syncDetailWithWardrobe(): void {
 function equipFromDetail(): void {
   const item = detailItem.value
   if (!item) return
+  // P2-12：条目可能已被别的标签页移出衣柜，操作前再校验一次
+  if (!wardrobe.value.some((row) => row.cosmeticId === item.cosmeticId)) {
+    ElMessage.warning('这件时装已不在衣柜里，请刷新后再试')
+    detailOpen.value = false
+    return
+  }
   if (item.missing) {
     ElMessage.warning('这件时装已下架，无法穿戴')
     return
@@ -771,12 +875,12 @@ function cardAriaLabel(item: WardrobeItem): string {
   return `${name}，${slot}，${isEquipped(item) ? '已穿戴' : '未穿戴'}`
 }
 
-/** 预览图 404 / 解码失败：记下来并退回首字占位（后端 asset_not_found 是合法返回） */
-function markThumbBroken(cosmeticId: string): void {
-  if (brokenThumbs.value.has(cosmeticId)) return
-  const next = new Set(brokenThumbs.value)
-  next.add(cosmeticId)
-  brokenThumbs.value = next
+/** P2-1：预览图 404 / 解码失败按**失败的 URL**记录，旧请求不会误杀新预览 */
+function markThumbBroken(event: Event): void {
+  const el = event.target as HTMLImageElement | null
+  const url = el?.getAttribute('src') || el?.currentSrc || ''
+  if (!url || brokenThumbUrls.value.has(url)) return
+  brokenThumbUrls.value = new Set(brokenThumbUrls.value).add(url)
 }
 
 function cosmeticName(slot: string): string {
@@ -811,22 +915,18 @@ function clearMissingSlot(slot: string): void {
 }
 
 /**
- * 卡片激活：普通模式 = 穿戴；批量管理模式 = 勾选/取消。
+ * 卡片激活（P2-7）：普通模式 = **打开详情**（穿戴改到详情弹窗里），批量模式 = 勾选。
  *
- * 为什么批量模式要接管卡片点击：让整张卡（含键盘 Enter/Space）都是勾选热区，
- * 用户不必精确点中那个小复选框；单件删除的 ✕ 在批量模式下会被隐藏，避免误触。
+ * 原来「点整张卡 = 立即穿戴」，手指稍偏就会误改 selection / dirty，甚至误删；
+ * 穿戴是会影响「保存穿戴」的写操作，放到详情弹窗里二次确认最安全。
+ * 批量模式下仍接管卡片点击，让整张卡（含键盘 Enter/Space）都是勾选热区。
  */
 function onCardActivate(item: WardrobeItem): void {
   if (batchMode.value) {
     toggleSelect(item)
     return
   }
-  if (item.missing) {
-    // 已下架：不能穿戴，但可以删 —— 明确告诉用户还能做什么
-    ElMessage.warning('这件时装已下架，无法穿戴（仍可从衣柜移除）')
-    return
-  }
-  equip(item)
+  openDetail(item)
 }
 
 function equip(item: WardrobeItem): void {
@@ -863,7 +963,7 @@ async function loadIdentities(): Promise<void> {
   identitiesError.value = false
   try {
     const { data } = await fashionApi.myIdentities()
-    if (seq !== identitiesSeq) return // 已被更新的请求取代，丢弃本次响应
+    if (isUnmounted || seq !== identitiesSeq) return // 已被更新的请求取代 / 组件已卸载
     identities.value = data.items || []
     const queryId = typeof route.query.identityId === 'string' ? route.query.identityId : ''
     const activeStillExists = identities.value.some((item) => item.id === activeIdentityId.value)
@@ -881,11 +981,11 @@ async function loadIdentities(): Promise<void> {
     // 否则地址栏一直挂着一个后端不认的身份，刷新/分享出去都还要再回落一次
     if (queryId && queryId !== activeIdentityId.value) syncIdentityQuery()
   } catch (error) {
-    if (seq !== identitiesSeq) return
+    if (isUnmounted || seq !== identitiesSeq) return
     identitiesError.value = true
     notifyFashionError(error, '读取绑定信息失败')
   } finally {
-    if (seq === identitiesSeq) loadingIdentities.value = false
+    if (!isUnmounted && seq === identitiesSeq) loadingIdentities.value = false
   }
 }
 
@@ -907,16 +1007,17 @@ async function loadWardrobe(options: { silent?: boolean } = {}): Promise<void> {
   wardrobeError.value = false
   try {
     const { data } = await fashionApi.wardrobe()
-    if (seq !== wardrobeSeq) return // 已被更新的请求取代，丢弃本次响应
+    if (isUnmounted || seq !== wardrobeSeq) return // 已被更新的请求取代 / 组件已卸载
     wardrobe.value = data.items || []
-    // B4（真 bug）：brokenThumbs 原来一旦标记就永不重置 —— 管理员补传资产后，
-    // 玩家必须硬刷新才看得到缩略图。衣柜重新拉成功 = 资产可能已经补齐，全部重试一次。
-    brokenThumbs.value = new Set()
+    // B4（真 bug）+ P2-1：brokenThumbUrls 原来一旦标记就永不重置 —— 管理员补传
+    // 资产后玩家必须硬刷新才看得到缩略图。衣柜重新拉成功 = 资产可能已补齐，
+    // 全部按 URL 重试一次（换了 sha256 的条目本来也是新 URL）。
+    brokenThumbUrls.value = new Set()
     // 选中集合里可能留着已经不存在的 id（本页刚删 / 别的标签页删的）：
     // 不收敛的话「删除选中(n)」会带着幽灵 id 去请求，计数也会骗人
     pruneSelection()
     // 衣柜变短时把页码夹回有效范围，避免停在空页
-    const maxPage = Math.max(1, Math.ceil(filteredWardrobe.value.length / pageSize))
+    const maxPage = Math.max(1, Math.ceil(filteredWardrobe.value.length / pageSize.value))
     if (wardrobePage.value > maxPage) wardrobePage.value = maxPage
     // 衣柜空了就没有可管理的东西，直接退出批量模式，别让工具栏停在空状态
     if (wardrobe.value.length === 0 && batchMode.value) exitBatchMode()
@@ -925,11 +1026,11 @@ async function loadWardrobe(options: { silent?: boolean } = {}): Promise<void> {
     // 而弹窗里的名称/加入时间也是过期数据
     syncDetailWithWardrobe()
   } catch (error) {
-    if (seq !== wardrobeSeq) return
+    if (isUnmounted || seq !== wardrobeSeq) return
     wardrobeError.value = true
     notifyFashionError(error, '读取我的衣柜失败')
   } finally {
-    if (seq === wardrobeSeq) loadingWardrobe.value = false
+    if (!isUnmounted && seq === wardrobeSeq) loadingWardrobe.value = false
   }
 }
 
@@ -1175,7 +1276,7 @@ async function loadLoadout(): Promise<void> {
   const identityId = activeIdentityId.value || undefined
   try {
     const { data } = await fashionApi.getLoadout(identityId)
-    if (seq !== loadoutSeq) return // 已被更新的请求取代，丢弃本次响应
+    if (isUnmounted || seq !== loadoutSeq) return // 已被更新的请求取代 / 组件已卸载
     const next: Record<string, { cosmeticId: string; scale: number }> = {}
     const missing = new Set<string>()
     // 衣柜只存收藏，正在穿戴的时装可能不在衣柜里：名称用 loadout 回填的 name 兜底
@@ -1194,7 +1295,7 @@ async function loadLoadout(): Promise<void> {
     loadoutLabels.value = labels
     savedSnapshot.value = snapshot()
   } catch (error) {
-    if (seq !== loadoutSeq) return
+    if (isUnmounted || seq !== loadoutSeq) return
     const code = fashionErrorCode(error)
     if (code === 'no_identity') {
       noIdentity.value = true
@@ -1220,7 +1321,7 @@ async function loadLoadout(): Promise<void> {
     }
     notifyFashionError(error, '读取穿戴配置失败')
   } finally {
-    if (seq === loadoutSeq) loadingLoadout.value = false
+    if (!isUnmounted && seq === loadoutSeq) loadingLoadout.value = false
   }
 }
 
@@ -1332,7 +1433,10 @@ onMounted(async () => {
   // 之后再 addEventListener 会留下一个永不释放的监听器（还会按旧状态弹刷新确认）
   window.addEventListener('beforeunload', onBeforeUnload)
   await loadIdentities()
+  // P3：卸载后不再继续发后续请求 / 弹窗 / 改 URL
+  if (isUnmounted) return
   await Promise.all([loadWardrobe(), identitiesError.value ? Promise.resolve() : loadLoadout()])
+  if (isUnmounted) return
   applyStoreDeepLink()
 })
 
@@ -1348,11 +1452,22 @@ onMounted(async () => {
  * 命中不了说明这件在别的标签页被移出了衣柜 —— 提示去商店重新加入。
  */
 function applyStoreDeepLink(): void {
+  if (isUnmounted) return
   const cosmeticId = typeof route.query.cosmeticId === 'string' ? route.query.cosmeticId : ''
   if (!cosmeticId) return
   const item = wardrobeMap.value.get(cosmeticId) || wardrobeMap.value.get(localIdOf(cosmeticId))
+  // P2-12：移动端不自动弹详情 —— 网络回来时用户可能已经在操作，突然盖一层遮罩
+  // 抢焦点体验很差；改成一条提示，让用户自己点卡片进详情。
+  const isMobile =
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(max-width: 768px)').matches
   if (item) {
-    openDetail(item)
+    if (isMobile) {
+      ElMessage.info(`已在衣柜中找到「${displayName(item)}」，点卡片可查看详情 / 穿戴`)
+    } else {
+      openDetail(item)
+    }
   } else if (wardrobeError.value) {
     // 衣柜根本没读到（网络 / 500）：不能断言「这件不在你衣柜里」——
     // 那是把一次读取失败说成业务结论，用户会以为收藏丢了
@@ -1360,12 +1475,18 @@ function applyStoreDeepLink(): void {
   } else {
     ElMessage.info('这件时装还没在你的衣柜里，可到「时装商店」点「加入衣柜」后再来穿戴')
   }
+  if (isUnmounted) return
   const query = { ...route.query }
   delete query.cosmeticId
   void router.replace({ query })
 }
 
 onUnmounted(() => {
+  // P3：卸载后所有 pending 请求失效，不再写状态 / 弹提示 / 改 URL
+  isUnmounted = true
+  ++identitiesSeq
+  ++wardrobeSeq
+  ++loadoutSeq
   window.removeEventListener('beforeunload', onBeforeUnload)
 })
 
@@ -1880,5 +2001,124 @@ onBeforeRouteLeave(async () => {
 .save-hint {
   font-size: 12px;
   color: var(--text-secondary);
+}
+
+/* ===== 预览大图加载态 / 失败兜底（P2-2）===== */
+.detail-image {
+  max-height: 100%;
+}
+
+.detail-placeholder,
+.detail-image-error {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-2);
+  width: 100%;
+  height: 100%;
+  min-height: 120px;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.loading-spinner {
+  width: 22px;
+  height: 22px;
+  border: 2px solid var(--border-subtle);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: fashion-wardrobe-spin 0.8s linear infinite;
+}
+
+@keyframes fashion-wardrobe-spin {
+  to { transform: rotate(360deg); }
+}
+
+.zoom-hint {
+  margin: 0;
+  font-size: 11.5px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.missing-fallback {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+/* ===== 触控目标 ≥44px（P2-7）=====
+   用绝对定位的伪元素把「✕ 移除」「详情」「批量勾选框」的热区扩到 44×44，
+   不撑布局、不改变视觉大小；按钮本身仍保持原来的紧凑外观。 */
+.card-remove,
+.detail-link,
+.card-check {
+  touch-action: manipulation;
+}
+
+.detail-link {
+  position: relative;
+}
+
+.card-remove::after,
+.detail-link::after,
+.card-check::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
+}
+
+.cosmetic-card,
+.item-thumb,
+.card-remove,
+.detail-link {
+  touch-action: manipulation;
+}
+
+/* hover 变换只在真有 hover 的设备生效，避免触屏「粘住」 */
+@media (hover: none) {
+  .cosmetic-card:hover,
+  .card-remove:hover {
+    transform: none;
+    border-color: var(--border-subtle);
+  }
+}
+
+/* ===== 移动端（P2-8）=====
+   原文件只有 1000px 网格断点，320px 屏上 minmax(132px,1fr) 需要 276px
+   而内容宽只有 272px → 退化成超长单列；详情大图 200px 在横屏几乎占满弹窗。 */
+@media (max-width: 768px) {
+  .wardrobe-page {
+    padding: 8px;
+  }
+
+  .page-title {
+    font-size: 22px;
+  }
+
+  .wardrobe-cards {
+    grid-template-columns: repeat(auto-fill, minmax(112px, 1fr));
+    gap: 8px;
+  }
+
+  .detail-preview {
+    height: min(180px, 32dvh);
+  }
+}
+
+@media (max-height: 480px) {
+  .detail-preview {
+    height: 120px;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .cosmetic-card { transition: none; }
+  .loading-spinner { animation: none; }
 }
 </style>

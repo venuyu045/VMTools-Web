@@ -840,22 +840,40 @@ html.dark .pixel-btn.warning {
 }
 
 /* ===== RESPONSIVE MODAL / DIALOG ===== */
+/*
+ * P2-5：原规则混用 `4vh + 92dvh + 4vh`，旧 WebView 不认 dvh 时 `max-height` 整条失效、
+ * 且 vh/dvh 相加会超出视口把 footer 裁掉；teleport 到 body 的弹窗/viewer 也没有
+ * 安全区与 overscroll 处理。这里统一：
+ *  - vh + dvh 双写（旧 WebView 用 vh 兜底、新浏览器用 dvh）；
+ *  - margin 也用 dvh，且与 max-height 相加留余量，footer 始终可达；
+ *  - .el-dialog flex 列布局，__body 内部滚动；
+ *  - 遮罩层加 overscroll-behavior:contain 与 env(safe-area-inset-*)。
+ */
 @media (max-width: 768px) {
+  .el-overlay,
+  .el-overlay-dialog {
+    overscroll-behavior: contain;
+  }
+  .el-overlay-dialog {
+    padding-top: env(safe-area-inset-top, 0px);
+    padding-right: env(safe-area-inset-right, 0px);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+    padding-left: env(safe-area-inset-left, 0px);
+    -webkit-overflow-scrolling: touch;
+  }
+
   .el-dialog {
     width: 92% !important;
     max-width: 92vw !important;
-    margin-top: 4vh !important;
-  }
-
-  /* 窄屏：弹窗限高 + 内部滚动，保证底部操作按钮始终可达。
-     原状态：长表单弹窗（如「新建定时任务」747px 高）在 667px 视口下溢出 106px，
-     footer 的「确定/取消」被挤出屏幕且页面无法滚动 → 弹窗无法完成提交。
-     改为 dialog 限高 92dvh、body 内部滚动、footer 常驻可见。 */
-  .el-dialog {
+    max-height: 92vh !important;
     max-height: 92dvh !important;
+    /* 3dvh 上下 + 92dvh = 98dvh，留出余量给安全区 / 边框，footer 不会被裁 */
+    margin: 3vh auto !important;
+    margin: 3dvh auto !important;
     display: flex !important;
     flex-direction: column !important;
-    margin-bottom: 4vh !important;
+    padding-left: calc(16px + env(safe-area-inset-left, 0px));
+    padding-right: calc(16px + env(safe-area-inset-right, 0px));
   }
   .el-dialog__header {
     flex-shrink: 0;
@@ -870,12 +888,24 @@ html.dark .pixel-btn.warning {
   .el-dialog__footer {
     flex-shrink: 0;
     padding-top: 12px;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
     border-top: 1px solid var(--border-subtle);
   }
 
   .el-message-box {
     width: 90% !important;
     max-width: 340px !important;
+  }
+}
+
+/* 抽屉 teleport 到 body 时同样要避开刘海 / Home Indicator、锁住橡皮筋 */
+@media (max-width: 768px) {
+  .el-drawer {
+    overscroll-behavior: contain;
+  }
+  .el-drawer__body {
+    padding-bottom: calc(16px + env(safe-area-inset-bottom, 0px)) !important;
+    overscroll-behavior: contain;
   }
 }
 
@@ -1120,4 +1150,56 @@ html.dark .pixel-btn.warning {
 [data-theme="dark"] .el-form-item__error,
 html.dark .el-form-item__error {
   color: var(--danger) !important;
+}
+
+/* ============================================================
+   时装中心 el-image 全屏大图（ElImageViewer）：移动端关闭 / 手势 / 安全区
+   P1-1 + P2-9。viewer 用 preview-teleported 挂到 body，必须在这里统一覆盖。
+   ============================================================ */
+.el-image-viewer__wrapper {
+  /* 旧 WebView 用 100vh 兜底，现代浏览器用 100dvh 贴合动态工具栏 */
+  height: 100vh;
+  height: 100dvh;
+  overscroll-behavior: contain;
+  /* 遮罩本身不参与页面滚动链，避免背景橡皮筋 */
+  touch-action: none;
+}
+
+/* 关闭按钮：EP 默认 40~44px，手机上偏小且贴边（刘海 / 灵动岛）→ 放大 + 安全区 */
+.el-image-viewer__close {
+  width: 48px !important;
+  height: 48px !important;
+  min-width: 44px !important;
+  min-height: 44px !important;
+  font-size: 24px !important;
+  top: calc(40px + env(safe-area-inset-top, 0px)) !important;
+  right: calc(16px + env(safe-area-inset-right, 0px)) !important;
+  touch-action: manipulation;
+}
+
+/* 底部工具条避开 Home Indicator */
+.el-image-viewer__actions {
+  bottom: calc(30px + env(safe-area-inset-bottom, 0px)) !important;
+  overscroll-behavior: contain;
+}
+
+/* 左右翻页 / 进度等按钮触控友好 */
+.el-image-viewer__btn {
+  touch-action: manipulation;
+}
+
+/* 双指捏合交给 viewer 自己处理（EP 的 touchstart 已 preventDefault），
+   不让浏览器把捏合解释成页面缩放；同时避免横竖屏切换后的手势残留 */
+.el-image-viewer__canvas,
+.el-image-viewer__img {
+  touch-action: none;
+}
+
+/* 移动端：触屏没有 hover，卡片/按钮的 hover 变换容易「粘住」且干扰点击 */
+@media (hover: none) {
+  .store-item:hover,
+  .cosmetic-card:hover,
+  .card-remove:hover {
+    transform: none;
+  }
 }
